@@ -1,0 +1,57 @@
+# ---- 依赖 ----
+node_modules/
+
+# ---- 构建产物 ----
+dist/
+dist-tests/
+out/
+release/
+release-*/
+unpackage/
+build/
+*.apk
+*.zip
+*.exe
+*.dmg
+
+# ---- 测试/临时 ----
+test-results/
+playwright-report/
+.turbo/
+coverage/
+
+# ---- 本地运行数据（绝不提交）----
+# Pi 会话记录与运行数据
+sessions/
+active-sessions/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# ---- 敏感文件（绝不提交）----
+.env
+.env.*
+auth.json
+models.json
+settings.json
+local.properties
+*.pem
+*.key
+keystore*
+gradle.properties
+
+# ---- hermes-memory 临时恢复/退役文件 ----
+.*.recovery-*
+.*.retired-*
+.consolidation-locks/
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+nul
+NUL

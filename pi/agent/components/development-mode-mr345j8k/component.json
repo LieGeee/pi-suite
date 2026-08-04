@@ -1,0 +1,18 @@
+{
+  "id": "development-mode-mr345j8k",
+  "label": "手机",
+  "icon": "🧩",
+  "kind": "development-mode",
+  "source": "user",
+  "description": "用户配置的 Dock 组件。",
+  "componentPath": "S:\\tool\\pi\\agent\\components\\development-mode-mr345j8k\\component.json",
+  "developmentMode": {
+    "mainAgent": {
+      "provider": "",
+      "modelId": "",
+      "thinkingLevel": "medium"
+    },
+    "subagents": []
+  },
+  "configJson": "{}"
+}

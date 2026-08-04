@@ -1,0 +1,25 @@
+{
+  "name": "pi-mobile-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone relay server for pi-gui desktop/mobile sync.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node --no-warnings dist/src/index.js",
+    "dev": "pnpm run build && node --no-warnings --watch dist/src/index.js",
+    "test": "pnpm run build && node --no-warnings --test dist/tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "sql.js": "^1.14.1",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.13",
+    "typescript": "^5.9.3"
+  }
+}

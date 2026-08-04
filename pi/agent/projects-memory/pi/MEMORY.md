@@ -1,0 +1,3 @@
+Pi custom model config lives at S:/tool/pi/agent/models.json and settings at S:/tool/pi/agent/settings.json in this setup. For custom reasoning models, Pi only shows xhigh if model.thinkingLevelMap.xhigh is explicitly defined; otherwise supported thinking levels stop at high even when reasoning:true. <!-- created=2026-05-22, last=2026-05-22 -->
+§
+Pi config at S:/tool/pi uses agentDir S:/tool/pi/agent. Extensions under agent/extensions/ are auto-discovered, including subdirectories with index.ts; avoid also adding the same extension path to settings.json to prevent duplicate registration/conflict diagnostics. <!-- created=2026-05-22, last=2026-05-22 -->

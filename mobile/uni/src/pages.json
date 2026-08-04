@@ -1,0 +1,71 @@
+{
+  "pages": [
+    {
+      "path": "pages/tasks/index",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
+    },
+    {
+      "path": "pages/notifications/index",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
+    },
+    {
+      "path": "pages/settings/index",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
+    },
+    {
+      "path": "pages/conversation/index",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8",
+        "disableScroll": true
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "pi-gui",
+    "navigationBarBackgroundColor": "#f5f6f8",
+    "backgroundColor": "#f5f6f8",
+    "backgroundColorBottom": "#f5f6f8",
+    "backgroundColorTop": "#f5f6f8"
+  },
+  "tabBar": {
+    "color": "#7a7f87",
+    "selectedColor": "#17191c",
+    "backgroundColor": "#ffffff",
+    "borderStyle": "white",
+    "fontSize": "16px",
+    "iconWidth": "30px",
+    "spacing": "4px",
+    "height": "60px",
+    "list": [
+      {
+        "pagePath": "pages/tasks/index",
+        "text": "对话",
+        "iconPath": "static/tab-chat.png",
+        "selectedIconPath": "static/tab-chat-active.png"
+      },
+      {
+        "pagePath": "pages/notifications/index",
+        "text": "通知",
+        "iconPath": "static/tab-tasks.png",
+        "selectedIconPath": "static/tab-tasks-active.png"
+      },
+      {
+        "pagePath": "pages/settings/index",
+        "text": "设置",
+        "iconPath": "static/tab-settings.png",
+        "selectedIconPath": "static/tab-settings-active.png"
+      }
+    ]
+  }
+}

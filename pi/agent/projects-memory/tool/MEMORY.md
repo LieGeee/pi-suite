@@ -1,0 +1,1 @@
+voicenote（语音转文字工具）：本地 Windows 应用，开发路径 S:/tool/voicenote。全局快捷键 Alt+1，静音 1.5 秒由 VAD 自动结束，转写结果模拟键盘输入到当前焦点；设置界面控制是否开机自启，静默运行。Paraformer-tiny 的 ModelScope 模型已不可用，现使用 FunASR `paraformer`（约 848 MB）并复制到 `S:/tool/voicenote/models/paraformer`；CPU 推理测试可用，示例音频约 0.44 秒完成。 <!-- created=2026-07-20, last=2026-07-20 -->

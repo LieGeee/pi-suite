@@ -1,0 +1,3709 @@
+import type { BrowserWindow } from "electron";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  applyHostUiRequestToExtensionUiState,
+  type GenerateThreadTitleOptions,
+  isExtensionUiDialogRequest,
+  JsonCatalogStore,
+  PiSdkDriver,
+  type PiSdkDriverConfig,
+  sessionKey,
+} from "@pi-gui/pi-sdk-driver";
+import type { SessionCatalogEntry } from "@pi-gui/catalogs";
+import type {
+  NavigateSessionTreeOptions,
+  NavigateSessionTreeResult,
+  SessionTreeSnapshot,
+} from "@pi-gui/session-driver/types";
+import type {
+  CreateSessionOptions,
+  HostUiResponse,
+  SessionConfig,
+  SessionDriverEvent,
+  SessionQueuedMessage,
+  SessionRef,
+  SessionSnapshot,
+  WorkspaceRef,
+} from "@pi-gui/session-driver";
+import type {
+  ModelSettingsSnapshot,
+  RuntimeCommandRecord,
+  RuntimeLoginCallbacks,
+  RuntimeSettingsSnapshot,
+  RuntimeSnapshot,
+} from "@pi-gui/session-driver/runtime-types";
+import {
+  type AppearanceThemeId,
+  type AppearanceThemeRecord,
+  type AppView,
+  type ComponentDockState,
+  type DockComponentDefinition,
+  type DockComponentGenerationInput,
+  type ComposerAttachment,
+  type ComposerDraftSyncSource,
+  type ConversationSessionRef,
+  type ExtensionCommandCompatibilityRecord,
+  type ModelSettingsScopeMode,
+  createEmptyDesktopAppState,
+  type CreateSessionInput,
+  type CreateWorktreeInput,
+  type DesktopAppState,
+  type AppMode,
+  type DevelopmentModePreset,
+  type NotificationPreferences,
+  type MobileSyncConnectionStatus,
+  type MobileSyncSettings,
+  type QueuedComposerMessage,
+  type RemoveWorktreeInput,
+  type SelectedTranscriptRecord,
+  type SessionCategoryNode,
+  type SidebarTab,
+  type StartThreadInput,
+  type TranscriptMessage,
+  type WorkspaceSessionTarget,
+} from "../src/desktop-state";
+import type {
+  ThirdPartyDiscoveredModel,
+  ThirdPartyModelDiscoveryInput,
+  ThirdPartyModelProviderInput,
+} from "../src/ipc";
+import {
+  applyTimelineEvent,
+  appendAssistantDelta,
+  clearActiveAssistantMessage,
+} from "./app-store-timeline";
+import { applySessionEventState, updateSessionRecord } from "./app-store-session-state";
+import type { AppStoreInternals, RefreshStateOptions } from "./app-store-internals";
+import {
+  readPersistedUiState,
+  type LegacyPersistedUiState,
+  type PersistedUiState,
+  writePersistedUiState,
+} from "./app-store-persistence";
+import { JsonFileStore } from "./json-file-store";
+import { projectDevelopmentWorkflowOutputs } from "../src/development-workflow-projection";
+import { sanitizeDockComponentDefinitionForState } from "./component-dock-serialization";
+import {
+  serializeRuntimeByWorkspaceForRenderer,
+  serializeSessionCommandsBySessionForRenderer,
+  serializeSessionCommandsForRenderer,
+} from "./runtime-state-serialization";
+import {
+  type PendingRuntimeCommandExecution,
+  getLearnedCommandCompatibility,
+  pruneCompatibilityForRuntimeSnapshot,
+  recordLearnedCommandCompatibility,
+  restoreCompatibilityByWorkspace,
+  serializeCompatibilityByWorkspace,
+} from "./extension-command-compatibility";
+import {
+  buildWorktreeRecords,
+  buildWorkspaceRecords,
+  cloneComposerAttachments,
+  cloneTranscriptMessage,
+  latestSessionActivityAt,
+  mergeQueuedComposerMessages,
+  mapToRecord,
+  previewFromTranscript,
+  toSessionQueuedMessages,
+  toSessionRef,
+} from "./app-store-utils";
+import {
+  cloneComposerAttachmentsForRenderer,
+  cloneQueuedComposerMessagesForRenderer,
+  cloneTranscriptMessageForRenderer,
+  resolveRendererStreamingPublishMode,
+} from "./renderer-transcript";
+import { conversationRefKey, pruneConversationGroups } from "../src/conversation-collections";
+import { resolveRepoWorkspaceId } from "../src/workspace-roots";
+import { SessionStateMap, type QueuedComposerEditState } from "./session-state-map";
+import { createEmptyExtensionUiState, serializeExtensionUiState } from "./session-state-map";
+import { GitWorktreeManager } from "./worktree-manager";
+import * as workspace from "./app-store-workspace";
+import * as worktree from "./app-store-worktree";
+import * as composer from "./app-store-composer";
+import { isSessionActivelyViewed, isSessionVisibleInWindow } from "./session-visibility";
+
+type StateListener = (state: DesktopAppState) => void;
+type SelectedTranscriptListener = (payload: SelectedTranscriptRecord | null) => void;
+type SessionEventListener = (event: SessionDriverEvent, state: DesktopAppState) => void | Promise<void>;
+type TranscriptMessageRow = Extract<TranscriptMessage, { kind: "message" }>;
+
+const LEGACY_TRANSCRIPT_HISTORY_LIMIT = 180;
+const SELECTED_TRANSCRIPT_RENDER_LIMIT = 160;
+
+interface PersistedTranscriptRecord {
+  readonly version: 1;
+  readonly transcript: readonly TranscriptMessage[];
+}
+
+type PersistedTranscriptStoreValue = PersistedTranscriptRecord | readonly TranscriptMessage[];
+
+function isPersistedTranscriptRecord(value: PersistedTranscriptStoreValue): value is PersistedTranscriptRecord {
+  if (Array.isArray(value)) {
+    return false;
+  }
+  const candidate = value as { version?: unknown; transcript?: unknown };
+  return candidate.version === 1 && Array.isArray(candidate.transcript);
+}
+
+export interface DesktopAppStoreOptions {
+  readonly userDataDir: string;
+  readonly initialWorkspacePaths: readonly string[];
+  readonly initialSidebarTab?: SidebarTab;
+  readonly appearanceThemes?: readonly AppearanceThemeRecord[];
+  readonly getWindow?: () => BrowserWindow | null;
+  readonly shouldKeepSessionDialogs?: (sessionRef: SessionRef) => boolean;
+  readonly driverOptions?: Pick<PiSdkDriverConfig, "extensionFactories" | "inlineExtensionMetadata">;
+  readonly generateThreadTitleOverride?: (
+    workspace: WorkspaceRef,
+    options: GenerateThreadTitleOptions,
+  ) => Promise<string | null | undefined>;
+}
+
+export interface DesktopAppViewState {
+  readonly selectedWorkspaceId?: string;
+  readonly selectedSessionId?: string;
+  readonly activeView?: AppView;
+  readonly sidebarCollapsed?: boolean;
+}
+
+export class DesktopAppStore implements AppStoreInternals {
+  state = createEmptyDesktopAppState();
+  private readonly listeners = new Set<StateListener>();
+  private readonly selectedTranscriptListeners = new Set<SelectedTranscriptListener>();
+  private readonly selectedTranscriptDeltaListeners = new Set<(delta: {
+    readonly workspaceId: string;
+    readonly sessionId: string;
+    readonly messageId: string;
+    readonly textDelta?: string;
+    readonly replaceMessage?: Extract<TranscriptMessage, { kind: "message" }>;
+  }) => void>();
+  private readonly sessionEventListeners = new Set<SessionEventListener>();
+  readonly driver: PiSdkDriver;
+  readonly catalogStore: JsonCatalogStore;
+  readonly worktreeManager: GitWorktreeManager;
+  private readonly uiStateFilePath: string;
+  private readonly agentDir: string;
+  private readonly transcriptStore: JsonFileStore<PersistedTranscriptStoreValue>;
+  readonly attachmentStore: JsonFileStore<ComposerAttachment[]>;
+  readonly sessionState = new SessionStateMap();
+  readonly runtimeByWorkspace = new Map<string, RuntimeSnapshot>();
+  readonly extensionCommandCompatibilityByWorkspace = new Map<string, Map<string, ExtensionCommandCompatibilityRecord>>();
+  readonly pendingRuntimeCommandsBySession = new Map<string, PendingRuntimeCommandExecution>();
+  private readonly reportedCompatibilityIssuesBySession = new Map<string, Set<string>>();
+  private readonly initialWorkspacePaths: readonly string[];
+  private readonly getWindow: () => BrowserWindow | null;
+  private readonly shouldKeepSessionDialogs: (sessionRef: SessionRef) => boolean;
+  private composerDraftSyncTarget: SessionRef | undefined;
+  private composerDraftProjectionNonce = 0;
+  private persistUiStateTimer: NodeJS.Timeout | undefined;
+  private readonly transcriptPersistTimers = new Map<string, NodeJS.Timeout>();
+  private readonly restoredSelectedSessionKeysAwaitingSelection = new Set<string>();
+  private initPromise: Promise<void> | undefined;
+  private selectionEpoch = 0;
+  private refreshStateDepth = 0;
+  private streamingTranscriptPublishTimer: NodeJS.Timeout | undefined;
+  private readonly streamingAssistantBuffers = new Map<string, { readonly sessionRef: SessionRef; readonly chunks: string[] }>();
+  private readonly lastPublishedStreamingMessageBySession = new Map<string, { readonly messageId: string; readonly textLength: number }>();
+  private readonly sessionUpdatedTimers = new Map<string, NodeJS.Timeout>();
+
+  constructor(options: DesktopAppStoreOptions) {
+    const catalogFilePath = join(options.userDataDir, "catalogs.json");
+    const appearanceThemes = options.appearanceThemes ?? [];
+    this.state = {
+      ...this.state,
+      sidebarTab: options.initialSidebarTab ?? "conversations",
+      appearanceThemes,
+      appearanceTheme: appearanceThemes.some((theme) => theme.id === this.state.appearanceTheme)
+        ? this.state.appearanceTheme
+        : appearanceThemes[0]?.id ?? this.state.appearanceTheme,
+    };
+    const driverOptions: PiSdkDriverConfig = {
+      catalogFilePath,
+      ...(options.driverOptions ?? {}),
+      ...(options.generateThreadTitleOverride
+        ? { generateThreadTitleOverride: options.generateThreadTitleOverride }
+        : {}),
+    };
+
+    this.driver = new PiSdkDriver(driverOptions);
+    this.catalogStore = new JsonCatalogStore({ catalogFilePath });
+    this.worktreeManager = new GitWorktreeManager({ catalogStorage: this.catalogStore });
+    this.uiStateFilePath = join(options.userDataDir, "ui-state.json");
+    this.agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || join(options.userDataDir, "agent");
+    this.transcriptStore = new JsonFileStore<PersistedTranscriptStoreValue>(options.userDataDir, "transcripts");
+    this.attachmentStore = new JsonFileStore<ComposerAttachment[]>(options.userDataDir, "attachments");
+    this.initialWorkspacePaths = options.initialWorkspacePaths;
+    this.getWindow = options.getWindow ?? (() => null);
+    this.shouldKeepSessionDialogs = options.shouldKeepSessionDialogs ?? (() => false);
+  }
+
+  /* ── Lifecycle ──────────────────────────────────────────── */
+
+  async initialize(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = this.initializeInternal();
+    }
+    return this.initPromise;
+  }
+
+  async getState(): Promise<DesktopAppState> {
+    await this.initialize();
+    return structuredClone(this.state);
+  }
+
+  async getStateForView(view: DesktopAppViewState): Promise<DesktopAppState> {
+    await this.initialize();
+    return this.projectStateForView(view);
+  }
+
+  async getSelectedTranscript(): Promise<SelectedTranscriptRecord | null> {
+    await this.initialize();
+    const sessionRef = this.selectedSessionRef();
+    if (!sessionRef) {
+      return null;
+    }
+    await this.ensureTranscriptLoaded(sessionRef);
+    return this.buildSelectedTranscriptRecord(sessionRef);
+  }
+
+  async getSelectedTranscriptForView(view: DesktopAppViewState): Promise<SelectedTranscriptRecord | null> {
+    await this.initialize();
+    const sessionRef = this.selectedSessionRefForView(view);
+    if (!sessionRef) {
+      return null;
+    }
+    await this.ensureTranscriptLoaded(sessionRef);
+    return this.buildSelectedTranscriptRecord(sessionRef);
+  }
+
+  async getSelectedTranscriptWindowForView(
+    view: DesktopAppViewState,
+    request: { readonly workspaceId: string; readonly sessionId: string; readonly startIndex: number; readonly limit: number },
+  ): Promise<SelectedTranscriptRecord | null> {
+    await this.initialize();
+    const sessionRef = this.selectedSessionRefForView(view);
+    if (!sessionRef || sessionRef.workspaceId !== request.workspaceId || sessionRef.sessionId !== request.sessionId) {
+      return null;
+    }
+    await this.ensureTranscriptLoaded(sessionRef);
+    return this.buildSelectedTranscriptRecord(sessionRef, {
+      startIndex: request.startIndex,
+      limit: request.limit,
+    });
+  }
+
+  async getTranscript(target: WorkspaceSessionTarget): Promise<SelectedTranscriptRecord> {
+    await this.initialize();
+    const sessionRef = { workspaceId: target.workspaceId, sessionId: target.sessionId };
+    await this.ensureTranscriptLoaded(sessionRef);
+    return this.buildSelectedTranscriptRecord(sessionRef);
+  }
+
+  async getToolContentForView(
+    view: DesktopAppViewState,
+    request: { readonly workspaceId: string; readonly sessionId: string; readonly callId: string },
+  ): Promise<Extract<TranscriptMessage, { kind: "tool" }> | null> {
+    await this.initialize();
+    const sessionRef = this.selectedSessionRefForView(view);
+    if (!sessionRef || sessionRef.workspaceId !== request.workspaceId || sessionRef.sessionId !== request.sessionId) {
+      return null;
+    }
+    await this.ensureTranscriptLoaded(sessionRef);
+    const transcript = this.sessionState.transcriptCache.get(sessionKey(sessionRef)) ?? [];
+    const tool = transcript.find((item): item is Extract<TranscriptMessage, { kind: "tool" }> =>
+      item.kind === "tool" && item.callId === request.callId,
+    );
+    return tool ? cloneTranscriptMessageForRenderer(tool, { toolTextLimit: 64_000 }) as Extract<TranscriptMessage, { kind: "tool" }> : null;
+  }
+
+  projectStateForView(
+    view: DesktopAppViewState,
+    state: DesktopAppState = this.state,
+    previousView?: DesktopAppViewState,
+    options: { readonly skipClone?: boolean } = {},
+  ): DesktopAppState {
+    const selectedWorkspaceId = this.resolveViewWorkspaceId(view.selectedWorkspaceId, state);
+    const selectedSessionId = this.resolveViewSessionId(selectedWorkspaceId, view.selectedSessionId, state);
+    const previousWorkspaceId = previousView
+      ? this.resolveViewWorkspaceId(previousView.selectedWorkspaceId, state)
+      : selectedWorkspaceId;
+    const previousSessionId = previousView
+      ? this.resolveViewSessionId(previousWorkspaceId, previousView.selectedSessionId, state)
+      : selectedSessionId;
+    const selectionChanged =
+      selectedWorkspaceId !== previousWorkspaceId || selectedSessionId !== previousSessionId;
+    const matchesStateSelection =
+      selectedWorkspaceId === state.selectedWorkspaceId && selectedSessionId === state.selectedSessionId;
+    const syncTargetsProjectedSession =
+      state.composerDraftSyncSource === "extension-editor-text" &&
+      this.composerDraftSyncTarget?.workspaceId === selectedWorkspaceId &&
+      this.composerDraftSyncTarget?.sessionId === selectedSessionId;
+    const activeView = view.activeView ?? state.activeView;
+    const sidebarCollapsed = view.sidebarCollapsed ?? state.sidebarCollapsed;
+
+    const base = options.skipClone ? { ...state } : structuredClone(state);
+    return {
+      ...base,
+      selectedWorkspaceId,
+      selectedSessionId,
+      activeView,
+      sidebarCollapsed,
+      composerDraft: this.resolveComposerDraft(selectedWorkspaceId, selectedSessionId),
+      composerDraftSyncSource: selectionChanged
+        ? "selection"
+        : syncTargetsProjectedSession || (matchesStateSelection && state.composerDraftSyncSource !== "extension-editor-text")
+          ? state.composerDraftSyncSource
+          : "state",
+      composerDraftSyncNonce: selectionChanged
+        ? this.allocateComposerDraftSyncNonce(state.composerDraftSyncNonce)
+        : state.composerDraftSyncNonce,
+      composerAttachments: this.resolveComposerAttachments(selectedWorkspaceId, selectedSessionId),
+      queuedComposerMessages: this.resolveQueuedComposerMessages(selectedWorkspaceId, selectedSessionId),
+      editingQueuedMessageId: this.resolveEditingQueuedMessageId(selectedWorkspaceId, selectedSessionId),
+      developmentWorkflowProjection: this.resolveDevelopmentWorkflowProjection(state, selectedWorkspaceId, selectedSessionId),
+      lastError: this.resolveSelectedSessionError(selectedWorkspaceId, selectedSessionId, false) ?? (
+        selectedSessionId ? undefined : state.lastError
+      ),
+    };
+  }
+
+  async flushPersistence(): Promise<void> {
+    await this.initialize();
+    if (this.persistUiStateTimer) {
+      clearTimeout(this.persistUiStateTimer);
+      this.persistUiStateTimer = undefined;
+    }
+
+    const pendingTranscriptWrites = [...this.transcriptPersistTimers.entries()];
+    this.transcriptPersistTimers.clear();
+    await Promise.all(
+      pendingTranscriptWrites.map(async ([key, timer]) => {
+        clearTimeout(timer);
+        const transcript = (this.sessionState.transcriptCache.get(key) ?? []).map(cloneTranscriptMessage);
+        await this.writePersistedTranscript(key, transcript);
+      }),
+    );
+
+    await this.persistUiState();
+  }
+
+  async emitTestSessionEvent(event: SessionDriverEvent): Promise<void> {
+    await this.initialize();
+    await this.handleSessionEvent(event);
+  }
+
+  subscribe(listener: StateListener): () => void {
+    this.listeners.add(listener);
+    void this.getState().then(listener).catch(() => undefined);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  subscribeToSelectedTranscript(listener: SelectedTranscriptListener): () => void {
+    this.selectedTranscriptListeners.add(listener);
+    void this.getSelectedTranscript().then(listener).catch(() => undefined);
+    return () => {
+      this.selectedTranscriptListeners.delete(listener);
+    };
+  }
+
+  subscribeToSessionEvents(listener: SessionEventListener): () => void {
+    this.sessionEventListeners.add(listener);
+    return () => {
+      this.sessionEventListeners.delete(listener);
+    };
+  }
+
+  subscribeToTranscriptDelta(listener: (delta: {
+    readonly workspaceId: string;
+    readonly sessionId: string;
+    readonly messageId: string;
+    readonly textDelta?: string;
+    readonly replaceMessage?: Extract<TranscriptMessage, { kind: "message" }>;
+  }) => void): () => void {
+    this.selectedTranscriptDeltaListeners.add(listener);
+    return () => {
+      this.selectedTranscriptDeltaListeners.delete(listener);
+    };
+  }
+
+  /* ── Workspace methods (delegated) ─────────────────────── */
+
+  async addWorkspace(path: string): Promise<DesktopAppState> {
+    return workspace.addWorkspace(this, path);
+  }
+
+  getWorkspacePath(workspaceId: string): string | undefined {
+    return this.state.workspaces.find((w) => w.id === workspaceId)?.path;
+  }
+
+  getSkillFilePath(workspaceId: string, filePath: string): string | undefined {
+    return this.runtimeByWorkspace.get(workspaceId)?.skills.find((s) => s.filePath === filePath)?.filePath;
+  }
+
+  getExtensionFilePath(workspaceId: string, filePath: string): string | undefined {
+    return this.runtimeByWorkspace.get(workspaceId)?.extensions.find((entry) => entry.path === filePath)?.path;
+  }
+
+  async renameWorkspace(workspaceId: string, displayName: string): Promise<DesktopAppState> {
+    return workspace.renameWorkspace(this, workspaceId, displayName);
+  }
+
+  async removeWorkspace(workspaceId: string): Promise<DesktopAppState> {
+    return workspace.removeWorkspace(this, workspaceId);
+  }
+
+  async reorderWorkspaces(order: readonly string[]): Promise<DesktopAppState> {
+    await this.initialize();
+    const primaryIds = new Set(this.state.workspaces.filter((w) => w.kind === "primary").map((w) => w.id));
+    const sanitized = [...new Set(order)].filter((id) => primaryIds.has(id));
+    this.state = {
+      ...this.state,
+      workspaceOrder: sanitized,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async selectWorkspace(workspaceId: string): Promise<DesktopAppState> {
+    return workspace.selectWorkspace(this, workspaceId);
+  }
+
+  async selectSession(target: WorkspaceSessionTarget): Promise<DesktopAppState> {
+    return workspace.selectSession(this, target);
+  }
+
+  async renameSession(target: WorkspaceSessionTarget, title: string): Promise<DesktopAppState> {
+    return workspace.renameSession(this, target, title);
+  }
+
+  async selectSessionFast(target: WorkspaceSessionTarget): Promise<DesktopAppState> {
+    await this.initialize();
+    const sessionRef = toSessionRef(target);
+    if (!this.sessionFromState(sessionRef)) {
+      return this.withErrorHandling(async () =>
+        this.refreshState({
+          selectedWorkspaceId: target.workspaceId,
+          selectedSessionId: target.sessionId,
+          clearLastError: true,
+          activeView: "threads",
+        }),
+      );
+    }
+
+    return this.withErrorHandling(async () => {
+      const selectionEpoch = ++this.selectionEpoch;
+      const snapshot = this.applyFastSessionSelection(sessionRef);
+      void this.hydrateSelectedSessionAfterSelection(sessionRef, selectionEpoch, { markViewed: true }).catch((error) => {
+        void this.handleSelectedSessionHydrationError(sessionRef, selectionEpoch, error);
+      });
+      return structuredClone(snapshot);
+    });
+  }
+
+  async archiveSession(target: WorkspaceSessionTarget): Promise<DesktopAppState> {
+    return workspace.archiveSession(this, target);
+  }
+
+  async unarchiveSession(target: WorkspaceSessionTarget): Promise<DesktopAppState> {
+    return workspace.unarchiveSession(this, target);
+  }
+
+  async syncCurrentWorkspace(): Promise<DesktopAppState> {
+    return workspace.syncCurrentWorkspace(this);
+  }
+
+  /* ── Worktree methods (delegated) ──────────────────────── */
+
+  async createWorktree(input: CreateWorktreeInput): Promise<DesktopAppState> {
+    return worktree.createWorktree(this, input);
+  }
+
+  async removeWorktree(input: RemoveWorktreeInput): Promise<DesktopAppState> {
+    return worktree.removeWorktree(this, input);
+  }
+
+  /* ── Composer methods (delegated) ──────────────────────── */
+
+  async updateComposerDraft(composerDraft: string): Promise<DesktopAppState> {
+    return composer.updateComposerDraft(this, composerDraft);
+  }
+
+  async addComposerAttachments(attachments: readonly ComposerAttachment[]): Promise<DesktopAppState> {
+    return composer.addComposerAttachments(this, attachments);
+  }
+
+  async removeComposerAttachment(attachmentId: string): Promise<DesktopAppState> {
+    return composer.removeComposerAttachment(this, attachmentId);
+  }
+
+  async submitComposer(
+    textInput: string,
+    options?: { readonly deliverAs?: "steer" | "followUp" },
+  ): Promise<DesktopAppState> {
+    return composer.submitComposer(this, textInput, options);
+  }
+
+  async editQueuedComposerMessage(messageId: string, currentDraft?: string): Promise<DesktopAppState> {
+    return composer.editQueuedComposerMessage(this, messageId, currentDraft);
+  }
+
+  async cancelQueuedComposerEdit(): Promise<DesktopAppState> {
+    return composer.cancelQueuedComposerEdit(this);
+  }
+
+  async removeQueuedComposerMessage(messageId: string): Promise<DesktopAppState> {
+    return composer.removeQueuedComposerMessage(this, messageId);
+  }
+
+  async steerQueuedComposerMessage(messageId: string): Promise<DesktopAppState> {
+    return composer.steerQueuedComposerMessage(this, messageId);
+  }
+
+  async cancelCurrentRun(): Promise<DesktopAppState> {
+    return composer.cancelCurrentRun(this);
+  }
+
+  async runDevelopmentOrchestration(): Promise<DesktopAppState> {
+    return composer.runDevelopmentOrchestration(this);
+  }
+
+  async getSessionTree(target: WorkspaceSessionTarget): Promise<SessionTreeSnapshot> {
+    await this.initialize();
+    const sessionRef = toSessionRef(target);
+    await this.ensureSessionReady(sessionRef);
+    return this.driver.getSessionTree(sessionRef);
+  }
+
+  async navigateSessionTree(
+    target: WorkspaceSessionTarget,
+    targetId: string,
+    options?: NavigateSessionTreeOptions,
+  ): Promise<{ readonly state: DesktopAppState; readonly result: NavigateSessionTreeResult }> {
+    await this.initialize();
+    const sessionRef = toSessionRef(target);
+    await this.ensureSessionReady(sessionRef);
+
+    const result = await this.driver.navigateSessionTree(sessionRef, targetId, options);
+    if (!result.cancelled && !result.aborted) {
+      await this.reloadTranscriptFromDriver(sessionRef);
+      await this.refreshSessionCommandsFor(sessionRef);
+      const state = await this.refreshState({
+        selectedWorkspaceId: target.workspaceId,
+        selectedSessionId: target.sessionId,
+        clearLastError: true,
+        markSelectedSessionViewed: false,
+      });
+      return { state, result };
+    }
+
+    return {
+      state: structuredClone(this.state),
+      result,
+    };
+  }
+
+  /* ── Session / thread methods (delegated) ───────────────── */
+
+  async startThread(input: StartThreadInput): Promise<DesktopAppState> {
+    return worktree.startThread(this, input);
+  }
+
+  async createSession(input: CreateSessionInput): Promise<DesktopAppState> {
+    return workspace.createSession(this, input);
+  }
+
+  /* ── View / UI state ───────────────────────────────────── */
+
+  async setActiveView(activeView: AppView): Promise<DesktopAppState> {
+    await this.initialize();
+    if (this.state.activeView === "threads" && activeView !== "threads") {
+      const sessionRef = this.selectedSessionRef();
+      if (sessionRef) {
+        await this.cancelPendingDialogsForSession(sessionRef);
+      }
+    }
+    this.state = {
+      ...this.state,
+      activeView,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    if (activeView === "threads") {
+      this.markSelectedSessionViewedIfVisible();
+    }
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setSidebarCollapsed(sidebarCollapsed: boolean): Promise<DesktopAppState> {
+    await this.initialize();
+    if (this.state.sidebarCollapsed === sidebarCollapsed) {
+      return structuredClone(this.state);
+    }
+    this.state = {
+      ...this.state,
+      sidebarCollapsed,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setSidebarTab(sidebarTab: SidebarTab): Promise<DesktopAppState> {
+    await this.initialize();
+    if (this.state.sidebarTab === sidebarTab) {
+      return structuredClone(this.state);
+    }
+    this.state = {
+      ...this.state,
+      sidebarTab,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setAppearanceTheme(appearanceTheme: AppearanceThemeId): Promise<DesktopAppState> {
+    await this.initialize();
+    if (!this.state.appearanceThemes.some((theme) => theme.id === appearanceTheme)) {
+      return this.withError(new Error(`未知外观主题：${appearanceTheme}`));
+    }
+    if (this.state.appearanceTheme === appearanceTheme) {
+      return structuredClone(this.state);
+    }
+    this.state = {
+      ...this.state,
+      appearanceTheme,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async createConversationGroup(name: string): Promise<DesktopAppState> {
+    await this.initialize();
+    const normalizedName = normalizeConversationGroupName(name);
+    const now = new Date().toISOString();
+    this.state = {
+      ...this.state,
+      conversationGroups: [
+        ...this.state.conversationGroups,
+        {
+          id: randomUUID(),
+          name: normalizedName,
+          sessions: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      ],
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async renameConversationGroup(groupId: string, name: string): Promise<DesktopAppState> {
+    await this.initialize();
+    const normalizedName = normalizeConversationGroupName(name);
+    if (!this.state.conversationGroups.some((group) => group.id === groupId)) {
+      return this.withError(new Error(`未知对话分组：${groupId}`));
+    }
+    const now = new Date().toISOString();
+    this.state = {
+      ...this.state,
+      conversationGroups: this.state.conversationGroups.map((group) =>
+        group.id === groupId ? { ...group, name: normalizedName, updatedAt: now } : group,
+      ),
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async deleteConversationGroup(groupId: string): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = {
+      ...this.state,
+      conversationGroups: this.state.conversationGroups.filter((group) => group.id !== groupId),
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async assignConversationToGroup(
+    target: ConversationSessionRef,
+    groupId?: string,
+  ): Promise<DesktopAppState> {
+    await this.initialize();
+    if (!this.sessionFromState(target)) {
+      return this.withError(new Error(`未知对话：${target.workspaceId}/${target.sessionId}`));
+    }
+    if (groupId && !this.state.conversationGroups.some((group) => group.id === groupId)) {
+      return this.withError(new Error(`未知对话分组：${groupId}`));
+    }
+
+    const targetKey = conversationRefKey(target);
+    const now = new Date().toISOString();
+    this.state = {
+      ...this.state,
+      conversationGroups: this.state.conversationGroups.map((group) => {
+        const sessions = group.sessions.filter((ref) => conversationRefKey(ref) !== targetKey);
+        if (group.id === groupId) {
+          sessions.push(target);
+        }
+        return sessions.length === group.sessions.length && group.id !== groupId
+          ? group
+          : { ...group, sessions, updatedAt: now };
+      }),
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setNotificationPreferences(preferences: Partial<NotificationPreferences>): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = {
+      ...this.state,
+      notificationPreferences: {
+        ...this.state.notificationPreferences,
+        ...preferences,
+      },
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setMobileSyncSettings(settings: MobileSyncSettings): Promise<DesktopAppState> {
+    await this.initialize();
+    const serverUrl = settings.serverUrl.trim();
+    this.state = {
+      ...this.state,
+      mobileSync: {
+        ...settings,
+        serverUrl,
+        pairToken: settings.pairToken.trim(),
+        connectionStatus: serverUrl ? "disconnected" : "not-configured",
+        lastError: undefined,
+      },
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setDifyConfig(config: import("../src/desktop-state").DifyConfig): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = {
+      ...this.state,
+      difyConfig: {
+        serverUrl: config.serverUrl.trim(),
+        apiKey: config.apiKey.trim(),
+      },
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    this.schedulePersistUiState();
+    return this.emit();
+  }
+
+  async setCliTools(tools: readonly import("../src/desktop-state").CliToolConfig[]): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = {
+      ...this.state,
+      cliTools: tools,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    this.schedulePersistUiState();
+    return this.emit();
+  }
+
+  async setMobileSyncConnectionStatus(
+    connectionStatus: MobileSyncConnectionStatus,
+    lastError?: string,
+  ): Promise<DesktopAppState> {
+    await this.initialize();
+    const current = this.state.mobileSync;
+    if (current.connectionStatus === connectionStatus && current.lastError === lastError) {
+      return structuredClone(this.state);
+    }
+    this.state = {
+      ...this.state,
+      mobileSync: {
+        ...current,
+        connectionStatus,
+        ...(connectionStatus === "connected" ? { lastConnectedAt: new Date().toISOString() } : {}),
+        lastError,
+      },
+      revision: this.state.revision + 1,
+    };
+    this.schedulePersistUiState();
+    return this.emit();
+  }
+
+  async setIntegratedTerminalShell(integratedTerminalShell: string): Promise<DesktopAppState> {
+    await this.initialize();
+    const normalizedShell = integratedTerminalShell.trim();
+    if (this.state.integratedTerminalShell === normalizedShell) {
+      return this.emit();
+    }
+    this.state = {
+      ...this.state,
+      integratedTerminalShell: normalizedShell,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setEnableTransparency(enabled: boolean): Promise<DesktopAppState> {
+    await this.initialize();
+    if (this.state.enableTransparency === enabled) {
+      return structuredClone(this.state);
+    }
+    this.state = {
+      ...this.state,
+      enableTransparency: enabled,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setBackgroundGradientIntensity(value: number): Promise<DesktopAppState> {
+    await this.initialize();
+    const nextValue = Math.max(0, Math.min(100, Math.round(value)));
+    if (this.state.backgroundGradientIntensity === nextValue) {
+      return structuredClone(this.state);
+    }
+    this.state = {
+      ...this.state,
+      backgroundGradientIntensity: nextValue,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setComponentDock(componentDock: ComponentDockState): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = {
+      ...this.state,
+      componentDock,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setDevelopmentModePresets(presets: readonly DevelopmentModePreset[]): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = this.syncDevelopmentWorkflowProjection({
+      ...this.state,
+      developmentModePresets: presets,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    }, { workspaceId: this.state.selectedWorkspaceId, sessionId: this.state.selectedSessionId });
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setActiveDevelopmentModePresetId(id: string | null): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = this.syncDevelopmentWorkflowProjection({
+      ...this.state,
+      activeDevelopmentModePresetId: id,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    }, { workspaceId: this.state.selectedWorkspaceId, sessionId: this.state.selectedSessionId });
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setAppMode(mode: AppMode): Promise<DesktopAppState> {
+    await this.initialize();
+    this.state = this.syncDevelopmentWorkflowProjection({
+      ...this.state,
+      appMode: mode,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    }, { workspaceId: this.state.selectedWorkspaceId, sessionId: this.state.selectedSessionId });
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async setWorkspaceSessionCategories(
+    workspaceId: string,
+    categories: readonly SessionCategoryNode[],
+  ): Promise<DesktopAppState> {
+    await this.initialize();
+    const normalizedCategories = normalizeSessionCategoryNodes(categories, 1);
+    this.state = {
+      ...this.state,
+      sessionCategoriesByWorkspace: updateRecordValue(
+        this.state.sessionCategoriesByWorkspace,
+        workspaceId,
+        normalizedCategories.length > 0 ? { version: 1, categories: normalizedCategories } : undefined,
+      ),
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async generateDockComponentDefinition(
+    input: DockComponentGenerationInput,
+  ): Promise<DockComponentDefinition | null> {
+    await this.initialize();
+    return this.driver.generateDockComponentDefinition(input);
+  }
+
+  async saveDockComponentDefinition(
+    definition: DockComponentDefinition,
+    pinned: boolean,
+  ): Promise<DesktopAppState> {
+    await this.initialize();
+    return this.withErrorHandling(async () => {
+      await writeDockComponentDefinition(this.agentDir, definition);
+      const componentDefinitions = await loadDockComponentDefinitions(this.agentDir);
+      const pinnedComponentIds = pinned
+        ? mergeEnabledModelPatterns(this.state.componentDock.pinnedComponentIds, [definition.id])
+        : this.state.componentDock.pinnedComponentIds.filter((id) => id !== definition.id);
+      this.state = {
+        ...this.state,
+        componentDock: {
+          ...this.state.componentDock,
+          componentDefinitions,
+          pinnedComponentIds,
+        },
+        lastError: undefined,
+        revision: this.state.revision + 1,
+      };
+      await this.persistUiState();
+      return this.emit();
+    });
+  }
+
+  async setModelSettingsScopeMode(modelSettingsScopeMode: ModelSettingsScopeMode): Promise<DesktopAppState> {
+    await this.initialize();
+    if (this.state.modelSettingsScopeMode === modelSettingsScopeMode) {
+      return this.emit();
+    }
+    if (modelSettingsScopeMode === "app-global") {
+      await this.restoreGlobalModelSettings(this.state.globalModelSettings);
+    }
+    this.state = {
+      ...this.state,
+      modelSettingsScopeMode,
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.refreshState({ clearLastError: true });
+  }
+
+  /* ── Runtime / model / provider settings ───────────────── */
+
+  async refreshRuntime(workspaceId?: string): Promise<DesktopAppState> {
+    await this.initialize();
+    const resolvedWorkspaceId = workspaceId || this.state.selectedWorkspaceId;
+    const ws = this.workspaceRefFromState(resolvedWorkspaceId);
+    if (!ws) {
+      return this.emit();
+    }
+
+    return this.withErrorHandling(async () => {
+      const snapshot = await this.driver.runtimeSupervisor.refreshRuntime(ws);
+      this.runtimeByWorkspace.set(ws.workspaceId, snapshot);
+      this.clearExtensionUiForWorkspace(ws.workspaceId);
+      await this.reloadSessionsForWorkspace(ws.workspaceId);
+      await this.refreshSessionCommandsForWorkspace(ws.workspaceId);
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  async setSessionModel(target: WorkspaceSessionTarget, provider: string, modelId: string): Promise<DesktopAppState> {
+    return composer.setSessionModel(this, target, provider, modelId);
+  }
+
+  async setDefaultModel(workspaceId: string, provider: string, modelId: string): Promise<DesktopAppState> {
+    const targetWorkspaceId = this.resolveModelSettingsWorkspaceId(workspaceId);
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return this.withRuntimeUpdate(targetWorkspaceId, (ws) =>
+        this.driver.runtimeSupervisor.setDefaultModel(ws, { provider, modelId }),
+      );
+    }
+    await this.initialize();
+    const ws = this.workspaceRefFromState(targetWorkspaceId);
+    if (!ws) {
+      return this.withError(`Unknown workspace: ${targetWorkspaceId}`);
+    }
+    return this.withErrorHandling(async () => {
+      await updateProjectModelSettingsFile(ws.path, (settings) => ({
+        ...settings,
+        defaultProvider: provider,
+        defaultModel: modelId,
+      }));
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  async setDefaultThinkingLevel(
+    workspaceId: string,
+    thinkingLevel: RuntimeSettingsSnapshot["defaultThinkingLevel"],
+  ): Promise<DesktopAppState> {
+    const targetWorkspaceId = this.resolveModelSettingsWorkspaceId(workspaceId);
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return this.withRuntimeUpdate(targetWorkspaceId, (ws) =>
+        this.driver.runtimeSupervisor.setDefaultThinkingLevel(ws, thinkingLevel),
+      );
+    }
+    await this.initialize();
+    const ws = this.workspaceRefFromState(targetWorkspaceId);
+    if (!ws) {
+      return this.withError(`Unknown workspace: ${targetWorkspaceId}`);
+    }
+    return this.withErrorHandling(async () => {
+      await updateProjectModelSettingsFile(ws.path, (settings) => ({
+        ...settings,
+        ...(thinkingLevel ? { defaultThinkingLevel: thinkingLevel } : {}),
+      }));
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  async setSessionThinkingLevel(
+    sessionRef: SessionRef,
+    thinkingLevel: NonNullable<RuntimeSettingsSnapshot["defaultThinkingLevel"]>,
+  ): Promise<DesktopAppState> {
+    return composer.setSessionThinkingLevel(this, sessionRef, thinkingLevel);
+  }
+
+  async loginProvider(workspaceId: string, providerId: string, callbacks: RuntimeLoginCallbacks): Promise<DesktopAppState> {
+    await this.initialize();
+    const targetWorkspaceId = this.resolveModelSettingsWorkspaceId(workspaceId);
+    const ws = this.workspaceRefFromState(workspaceId);
+    if (!ws) {
+      return this.withError(`Unknown workspace: ${workspaceId}`);
+    }
+
+    return this.withErrorHandling(async () => {
+      const snapshot = await this.driver.runtimeSupervisor.login(ws, providerId, callbacks);
+      this.runtimeByWorkspace.set(workspaceId, snapshot);
+      await this.autoEnableModelsForConnectedProvider(targetWorkspaceId, providerId, snapshot);
+      await this.refreshSessionCommandsForWorkspace(workspaceId);
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  async logoutProvider(workspaceId: string, providerId: string): Promise<DesktopAppState> {
+    return this.withRuntimeUpdate(workspaceId, (ws) =>
+      this.driver.runtimeSupervisor.logout(ws, providerId),
+    );
+  }
+
+  async setProviderApiKey(workspaceId: string, providerId: string, apiKey: string): Promise<DesktopAppState> {
+    return this.withRuntimeUpdate(workspaceId, (ws) =>
+      this.driver.runtimeSupervisor.setProviderApiKey(ws, providerId, apiKey),
+    );
+  }
+
+  async discoverThirdPartyModels(input: ThirdPartyModelDiscoveryInput): Promise<readonly ThirdPartyDiscoveredModel[]> {
+    return discoverThirdPartyModels(input);
+  }
+
+  async saveThirdPartyModelProvider(
+    workspaceId: string,
+    input: ThirdPartyModelProviderInput,
+  ): Promise<DesktopAppState> {
+    const targetWorkspaceId = this.resolveModelSettingsWorkspaceId(workspaceId);
+    await this.initialize();
+    const ws = this.workspaceRefFromState(targetWorkspaceId);
+    if (!ws) {
+      return this.withError(`Unknown workspace: ${targetWorkspaceId}`);
+    }
+
+    return this.withErrorHandling(async () => {
+      await upsertThirdPartyModelProvider(this.agentDir, input);
+      const refreshedSnapshot = await this.driver.runtimeSupervisor.refreshRuntime(ws);
+      const selectedPatterns = input.selectedModels.map((model) => `${input.providerId}/${model.id}`);
+      const nextPatterns = mergeEnabledModelPatterns(refreshedSnapshot.settings.enabledModelPatterns, selectedPatterns);
+      const snapshot = await this.driver.runtimeSupervisor.setScopedModelPatterns(ws, nextPatterns);
+      this.runtimeByWorkspace.set(targetWorkspaceId, snapshot);
+      await this.refreshSessionCommandsForWorkspace(targetWorkspaceId);
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  async setEnableSkillCommands(workspaceId: string, enabled: boolean): Promise<DesktopAppState> {
+    return this.withRuntimeUpdate(workspaceId, (ws) =>
+      this.driver.runtimeSupervisor.setEnableSkillCommands(ws, enabled),
+      { reloadSessions: true },
+    );
+  }
+
+  async setScopedModelPatterns(workspaceId: string, patterns: readonly string[]): Promise<DesktopAppState> {
+    const targetWorkspaceId = this.resolveModelSettingsWorkspaceId(workspaceId);
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return this.withRuntimeUpdate(targetWorkspaceId, (ws) =>
+        this.driver.runtimeSupervisor.setScopedModelPatterns(ws, patterns),
+      );
+    }
+    await this.initialize();
+    const ws = this.workspaceRefFromState(targetWorkspaceId);
+    if (!ws) {
+      return this.withError(`Unknown workspace: ${targetWorkspaceId}`);
+    }
+    return this.withErrorHandling(async () => {
+      await updateProjectModelSettingsFile(ws.path, (settings) => ({
+        ...settings,
+        enabledModels: patterns.length > 0 ? [...patterns] : undefined,
+      }));
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  private async autoEnableModelsForConnectedProvider(
+    workspaceId: string,
+    providerId: string,
+    snapshot: RuntimeSnapshot,
+  ): Promise<void> {
+    const providerModelPatterns = [...new Set(
+      snapshot.models
+        .filter((model) => model.available && model.providerId === providerId)
+        .map((model) => `${model.providerId}/${model.modelId}`),
+    )];
+    if (providerModelPatterns.length === 0) {
+      return;
+    }
+
+    const currentPatterns = snapshot.settings.enabledModelPatterns;
+    if (currentPatterns.length === 0) {
+      return;
+    }
+
+    const nextPatterns = mergeEnabledModelPatterns(currentPatterns, providerModelPatterns);
+    if (nextPatterns.length === currentPatterns.length) {
+      return;
+    }
+
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      const ownerWorkspace = this.workspaceRefFromState(workspaceId);
+      if (!ownerWorkspace) {
+        return;
+      }
+      const updatedSnapshot = await this.driver.runtimeSupervisor.setScopedModelPatterns(ownerWorkspace, nextPatterns);
+      this.runtimeByWorkspace.set(workspaceId, updatedSnapshot);
+      return;
+    }
+
+    const ownerWorkspace = this.workspaceRefFromState(workspaceId);
+    if (!ownerWorkspace) {
+      return;
+    }
+    await updateProjectModelSettingsFile(ownerWorkspace.path, (settings) => ({
+      ...settings,
+      enabledModels: nextPatterns,
+    }));
+  }
+
+  async setSkillEnabled(workspaceId: string, filePath: string, enabled: boolean): Promise<DesktopAppState> {
+    return this.withRuntimeUpdate(workspaceId, (ws) =>
+      this.driver.runtimeSupervisor.setSkillEnabled(ws, filePath, enabled),
+      { reloadSessions: true },
+    );
+  }
+
+  async setExtensionEnabled(workspaceId: string, filePath: string, enabled: boolean): Promise<DesktopAppState> {
+    return this.withRuntimeUpdate(workspaceId, (ws) =>
+      this.driver.runtimeSupervisor.setExtensionEnabled(ws, filePath, enabled),
+      { reloadSessions: true },
+    );
+  }
+
+  private async withRuntimeUpdate(
+    workspaceId: string,
+    action: (ws: WorkspaceRef) => Promise<RuntimeSnapshot>,
+    options?: {
+      readonly reloadSessions?: boolean;
+    },
+  ): Promise<DesktopAppState> {
+    await this.initialize();
+    const ws = this.workspaceRefFromState(workspaceId);
+    if (!ws) {
+      return this.withError(`Unknown workspace: ${workspaceId}`);
+    }
+
+    return this.withErrorHandling(async () => {
+      const snapshot = await action(ws);
+      this.runtimeByWorkspace.set(workspaceId, snapshot);
+      if (options?.reloadSessions) {
+        this.clearExtensionUiForWorkspace(workspaceId);
+        await this.reloadSessionsForWorkspace(workspaceId);
+      }
+      await this.refreshSessionCommandsForWorkspace(workspaceId);
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  /* ── Internal infrastructure (AppStoreInternals) ───────── */
+
+  private async initializeInternal(): Promise<void> {
+    const persisted = await this.readUiState();
+    try {
+      this.state = {
+        ...this.state,
+        activeView: persisted.activeView ?? this.state.activeView,
+        modelSettingsScopeMode: persisted.modelSettingsScopeMode ?? this.state.modelSettingsScopeMode,
+        globalModelSettings: persisted.appGlobalModelSettings ?? this.state.globalModelSettings,
+        notificationPreferences: {
+          ...this.state.notificationPreferences,
+          ...persisted.notificationPreferences,
+        },
+        mobileSync: persisted.mobileSync ?? this.state.mobileSync,
+        difyConfig: persisted.difyConfig ?? this.state.difyConfig,
+        cliTools: persisted.cliTools ?? this.state.cliTools,
+        integratedTerminalShell: persisted.integratedTerminalShell ?? this.state.integratedTerminalShell,
+        lastViewedAtBySession: persisted.lastViewedAtBySession ?? {},
+        workspaceOrder: persisted.workspaceOrder ?? [],
+        sidebarCollapsed: persisted.sidebarCollapsed ?? this.state.sidebarCollapsed,
+        sidebarTab: persisted.sidebarTab ?? this.state.sidebarTab,
+        appearanceTheme: resolvePersistedAppearanceTheme(
+          persisted.appearanceTheme,
+          this.state.appearanceTheme,
+          this.state.appearanceThemes,
+        ),
+        appearanceThemes: this.state.appearanceThemes,
+        conversationGroups: persisted.conversationGroups ?? [],
+        enableTransparency: persisted.enableTransparency ?? this.state.enableTransparency,
+        backgroundGradientIntensity: persisted.backgroundGradientIntensity ?? this.state.backgroundGradientIntensity,
+        componentDock: persisted.componentDock ?? this.state.componentDock,
+        sessionCategoriesByWorkspace: persisted.sessionCategoriesByWorkspace ?? this.state.sessionCategoriesByWorkspace,
+        appMode: persisted.appMode ?? this.state.appMode,
+        developmentModePresets: persisted.developmentModePresets ?? this.state.developmentModePresets,
+        activeDevelopmentModePresetId: persisted.activeDevelopmentModePresetId ?? this.state.activeDevelopmentModePresetId,
+      };
+      await this.migrateLegacyPersistence(persisted);
+      this.sessionState.lastViewedAtBySession.clear();
+      for (const [key, viewedAt] of Object.entries(persisted.lastViewedAtBySession ?? {})) {
+        if (viewedAt) {
+          this.sessionState.lastViewedAtBySession.set(key, viewedAt);
+        }
+      }
+      this.sessionState.composerDraftsBySession.clear();
+      for (const [key, draft] of Object.entries(persisted.composerDraftsBySession ?? {})) {
+        if (draft) {
+          this.sessionState.composerDraftsBySession.set(key, draft);
+        }
+      }
+      this.extensionCommandCompatibilityByWorkspace.clear();
+      for (const [workspaceId, records] of restoreCompatibilityByWorkspace(
+        persisted.extensionCommandCompatibilityByWorkspace,
+      )) {
+        this.extensionCommandCompatibilityByWorkspace.set(workspaceId, records);
+      }
+      const initialWorkspacePaths = this.initialWorkspacePaths.map((path) => path.trim()).filter(Boolean);
+      const knownWorkspaces = await this.driver.listWorkspaces();
+      const workspacesToSync = new Map<string, string | undefined>();
+
+      for (const workspacePath of initialWorkspacePaths) {
+        workspacesToSync.set(workspacePath, undefined);
+      }
+
+      for (const ws of knownWorkspaces.workspaces) {
+        workspacesToSync.set(ws.path, ws.displayName);
+      }
+
+      await Promise.all(
+        [...workspacesToSync.entries()].map(([workspacePath, displayName]) =>
+          this.driver.syncWorkspace(workspacePath, displayName),
+        ),
+      );
+
+      await this.refreshState({
+        selectedWorkspaceId: persisted.selectedWorkspaceId,
+        selectedSessionId: persisted.selectedSessionId,
+        composerDraft: persisted.composerDraft,
+        clearLastError: true,
+        refreshWorktrees: true,
+        hydrateSelectedSession: false,
+        markSelectedSessionViewed: false,
+      });
+      const restoredSessionRef = this.selectedSessionRef();
+      if (restoredSessionRef && persisted.selectedWorkspaceId && persisted.selectedSessionId) {
+        this.restoredSelectedSessionKeysAwaitingSelection.add(sessionKey(restoredSessionRef));
+      }
+      this.startSelectedSessionHydration(restoredSessionRef, { markViewed: false });
+    } catch (error) {
+      this.state = {
+        ...createEmptyDesktopAppState(),
+        sidebarTab: persisted.sidebarTab ?? this.state.sidebarTab,
+        appearanceTheme: resolvePersistedAppearanceTheme(
+          persisted.appearanceTheme,
+          this.state.appearanceTheme,
+          this.state.appearanceThemes,
+        ),
+        appearanceThemes: this.state.appearanceThemes,
+        conversationGroups: persisted.conversationGroups ?? [],
+        enableTransparency: persisted.enableTransparency ?? false,
+        backgroundGradientIntensity: persisted.backgroundGradientIntensity ?? createEmptyDesktopAppState().backgroundGradientIntensity,
+        componentDock: persisted.componentDock ?? createEmptyDesktopAppState().componentDock,
+        sessionCategoriesByWorkspace: persisted.sessionCategoriesByWorkspace ?? createEmptyDesktopAppState().sessionCategoriesByWorkspace,
+        lastError: error instanceof Error ? error.message : String(error),
+        revision: 1,
+      };
+      await this.persistUiState();
+      this.emit();
+    }
+  }
+
+  private async migrateLegacyPersistence(persisted: LegacyPersistedUiState): Promise<void> {
+    const transcriptEntries = Object.entries(persisted.transcripts ?? {});
+    await Promise.all(
+      transcriptEntries.map(async ([key, transcript]) => {
+        const clonedTranscript = transcript.map((item) => cloneTranscriptMessage(item as TranscriptMessage));
+        if (clonedTranscript.length > 0) {
+          if (this.isPossiblyTrimmedLegacyTranscript(clonedTranscript)) {
+            return;
+          }
+          this.sessionState.transcriptCache.set(key, clonedTranscript);
+          this.sessionState.loadedTranscriptKeys.add(key);
+          await this.writePersistedTranscript(key, clonedTranscript);
+        }
+      }),
+    );
+
+    const attachmentEntries = Object.entries(persisted.composerAttachmentsBySession ?? {});
+    await Promise.all(
+      attachmentEntries.map(async ([key, attachments]) => {
+        const cloned = cloneComposerAttachments(attachments as readonly ComposerAttachment[]);
+        if (cloned.length > 0) {
+          this.sessionState.composerAttachmentsBySession.set(key, cloned);
+          await this.attachmentStore.write(key, cloned);
+        }
+      }),
+    );
+  }
+
+  async refreshState(options: RefreshStateOptions = {}): Promise<DesktopAppState> {
+    this.refreshStateDepth += 1;
+    try {
+      const previousSelectedKey = this.currentSelectedSessionKey();
+      const [workspacesSnapshot, sessionsSnapshot] = await Promise.all([
+        this.driver.listWorkspaces(),
+        this.driver.listSessions(),
+      ]);
+      const worktreeEntries = options.refreshWorktrees
+        ? await worktree.syncAndListWorktrees(this, workspacesSnapshot.workspaces)
+        : (await this.catalogStore.worktrees.listWorktrees()).worktrees;
+
+      await this.pruneStaleSessionSubscriptions(sessionsSnapshot.sessions);
+      await this.ensureSubscriptionsForSessions(sessionsSnapshot.sessions);
+
+      // Archive-stale session state so it does not grow without bound.
+      // Transcripts, configs, drafts, etc. for archived sessions are reloaded
+      // on demand when the user clicks them (see ensureTranscriptLoaded).
+      const activeNonArchivedSessions = sessionsSnapshot.sessions.filter((entry) => !entry.archivedAt);
+      for (const session of sessionsSnapshot.sessions) {
+        if (session.archivedAt) {
+          const staleKey = sessionKey(session.sessionRef);
+          if (!this.sessionState.sessionSubscriptions.has(staleKey)) {
+            this.sessionState.deleteSession(staleKey);
+          }
+        }
+      }
+
+      const selectedWorkspaceId = resolveSelectedWorkspaceIdFromCatalog(
+        options.selectedWorkspaceId ?? this.state.selectedWorkspaceId,
+        workspacesSnapshot.workspaces,
+      );
+      const selectedSessionId = resolveSelectedSessionIdFromCatalog(
+        selectedWorkspaceId,
+        options.selectedSessionId ?? this.state.selectedSessionId,
+        sessionsSnapshot.sessions,
+      );
+
+      if (selectedWorkspaceId && selectedSessionId && options.hydrateSelectedSession !== false) {
+        const sessionRef = {
+          workspaceId: selectedWorkspaceId,
+          sessionId: selectedSessionId,
+        };
+        await this.ensureSessionReady(sessionRef);
+        await this.ensureComposerAttachmentsLoaded(sessionRef);
+      }
+
+      const workspaces = buildWorkspaceRecords(
+        workspacesSnapshot.workspaces,
+        worktreeEntries,
+        sessionsSnapshot.sessions,
+        this.sessionState.transcriptCache,
+        this.sessionState.runningSinceBySession,
+        this.sessionState.sessionConfigBySession,
+        this.sessionState.lastViewedAtBySession,
+      );
+      const worktreesByWorkspace = buildWorktreeRecords(workspacesSnapshot.workspaces, worktreeEntries);
+      const liveWorkspaceIds = new Set(workspaces.map((w) => w.id));
+      for (const wsId of this.runtimeByWorkspace.keys()) {
+        if (!liveWorkspaceIds.has(wsId)) {
+          this.runtimeByWorkspace.delete(wsId);
+        }
+      }
+      for (const workspaceId of this.extensionCommandCompatibilityByWorkspace.keys()) {
+        if (!liveWorkspaceIds.has(workspaceId)) {
+          this.extensionCommandCompatibilityByWorkspace.delete(workspaceId);
+        }
+      }
+
+      if (selectedWorkspaceId && !this.runtimeByWorkspace.has(selectedWorkspaceId)) {
+        await this.ensureRuntimeLoaded(selectedWorkspaceId, workspacesSnapshot.workspaces);
+      }
+      const secondaryWorkspacesToLoad = workspacesSnapshot.workspaces
+        .filter((workspace) => workspace.workspaceId !== selectedWorkspaceId)
+        .filter((workspace) => !this.runtimeByWorkspace.has(workspace.workspaceId));
+      const secondaryRuntimeLoads = await Promise.allSettled(
+        secondaryWorkspacesToLoad.map((workspace) => this.ensureRuntimeLoaded(workspace.workspaceId, workspacesSnapshot.workspaces)),
+      );
+      secondaryRuntimeLoads.forEach((result, index) => {
+        if (result.status === "fulfilled") {
+          return;
+        }
+        const failedWorkspace = secondaryWorkspacesToLoad[index];
+        console.warn(
+          `[pi-gui] Failed to preload runtime for ${failedWorkspace?.path ?? "unknown workspace"}: ${
+            result.reason instanceof Error ? result.reason.message : String(result.reason)
+          }`,
+        );
+      });
+      for (const runtime of this.runtimeByWorkspace.values()) {
+        pruneCompatibilityForRuntimeSnapshot(this.extensionCommandCompatibilityByWorkspace, runtime);
+      }
+      const liveGlobalModelSettings = await this.loadLiveGlobalModelSettings(
+        workspacesSnapshot.workspaces,
+        selectedWorkspaceId || workspacesSnapshot.workspaces[0]?.workspaceId,
+      );
+      const globalModelSettings =
+        this.state.modelSettingsScopeMode === "per-repo" && hasStoredModelSettings(this.state.globalModelSettings)
+          ? this.state.globalModelSettings
+          : liveGlobalModelSettings;
+      if (
+        this.state.modelSettingsScopeMode === "per-repo" &&
+        hasStoredModelSettings(globalModelSettings) &&
+        !modelSettingsEqual(globalModelSettings, liveGlobalModelSettings)
+      ) {
+        await this.restoreGlobalModelSettings(globalModelSettings, workspacesSnapshot.workspaces, selectedWorkspaceId);
+      }
+      const scopedModelSettingsByWorkspace =
+        this.state.modelSettingsScopeMode === "per-repo"
+          ? await this.loadScopedModelSettingsByWorkspace(workspaces, workspacesSnapshot.workspaces, globalModelSettings)
+          : undefined;
+      const runtimeByWorkspace = this.serializeEffectiveRuntimeState(workspaces, scopedModelSettingsByWorkspace);
+      const componentDefinitions = await loadDockComponentDefinitions(this.agentDir);
+      const componentDefinitionIds = new Set(componentDefinitions.map((component) => component.id));
+      const componentDock = {
+        ...this.state.componentDock,
+        componentDefinitions,
+        pinnedComponentIds: this.state.componentDock.pinnedComponentIds.filter((id) => componentDefinitionIds.has(id)),
+      };
+
+      const activeView = options.activeView ?? this.state.activeView;
+      const composerDraftSync = this.resolveComposerDraftSync(selectedWorkspaceId, selectedSessionId, options);
+      this.state = {
+        ...this.state,
+        workspaces,
+        worktreesByWorkspace,
+        selectedWorkspaceId,
+        selectedSessionId,
+        activeView,
+        runtimeByWorkspace,
+        sessionCommandsBySession: serializeSessionCommandsBySessionForRenderer(this.sessionState.sessionCommandsBySession),
+        sessionExtensionUiBySession: this.serializeSessionExtensionUiState(),
+        extensionCommandCompatibilityByWorkspace: serializeCompatibilityByWorkspace(this.extensionCommandCompatibilityByWorkspace),
+        lastViewedAtBySession: mapToRecord(this.sessionState.lastViewedAtBySession),
+        workspaceOrder: this.state.workspaceOrder,
+        sidebarTab: this.state.sidebarTab,
+        appearanceTheme: this.state.appearanceTheme,
+        conversationGroups: pruneConversationGroups(this.state.conversationGroups, workspaces),
+        modelSettingsScopeMode: this.state.modelSettingsScopeMode,
+        globalModelSettings,
+        componentDock,
+        composerDraft: this.resolveComposerDraft(selectedWorkspaceId, selectedSessionId, options.composerDraft),
+        composerDraftSyncSource: composerDraftSync.source,
+        composerDraftSyncNonce: composerDraftSync.nonce,
+        composerAttachments: this.resolveComposerAttachments(selectedWorkspaceId, selectedSessionId),
+        queuedComposerMessages: this.resolveQueuedComposerMessages(selectedWorkspaceId, selectedSessionId),
+        editingQueuedMessageId: this.resolveEditingQueuedMessageId(selectedWorkspaceId, selectedSessionId),
+        developmentWorkflowProjection: this.resolveDevelopmentWorkflowProjection(this.state, selectedWorkspaceId, selectedSessionId),
+        lastError: this.resolveSelectedSessionError(selectedWorkspaceId, selectedSessionId, options.clearLastError),
+        revision: this.state.revision + 1,
+      };
+
+      if (options.markSelectedSessionViewed ?? true) {
+        this.markSelectedSessionViewedIfVisible();
+      }
+
+      this.schedulePersistUiState();
+      const snapshot = this.emit();
+      if (this.currentSelectedSessionKey() !== previousSelectedKey) {
+        this.publishSelectedTranscript();
+      }
+      return snapshot;
+    } finally {
+      this.refreshStateDepth = Math.max(0, this.refreshStateDepth - 1);
+    }
+  }
+
+  private async pruneStaleSessionSubscriptions(sessions: readonly SessionCatalogEntry[]): Promise<void> {
+    const activeKeys = new Set(sessions.map((session) => sessionKey(session.sessionRef)));
+    this.sessionState.prune(activeKeys);
+  }
+
+  private async ensureSubscriptionsForSessions(sessions: readonly SessionCatalogEntry[]): Promise<void> {
+    for (const session of sessions) {
+      if (session.status !== "running") {
+        continue;
+      }
+      await this.ensureSessionSubscription(session.sessionRef);
+    }
+  }
+
+  async ensureSessionReady(sessionRef: SessionRef): Promise<SessionSnapshot | undefined> {
+    await this.ensureTranscriptLoaded(sessionRef);
+    let snapshot: SessionSnapshot | undefined;
+    if (!this.sessionState.sessionSubscriptions.has(sessionKey(sessionRef))) {
+      snapshot = await this.driver.openSession(sessionRef);
+      this.updateSessionConfig(sessionRef, snapshot.config);
+    }
+    await this.ensureSessionSubscribed(sessionRef);
+    await this.refreshSessionCommands(sessionRef);
+    return snapshot;
+  }
+
+  async ensureSessionSubscription(sessionRef: SessionRef): Promise<void> {
+    if (!this.sessionState.sessionSubscriptions.has(sessionKey(sessionRef))) {
+      const snapshot = await this.driver.openSession(sessionRef);
+      this.updateSessionConfig(sessionRef, snapshot.config);
+      this.updateQueuedComposerMessages(sessionRef, snapshot.queuedMessages);
+    }
+    await this.ensureSessionSubscribed(sessionRef);
+  }
+
+  private async ensureTranscriptLoaded(sessionRef: SessionRef): Promise<void> {
+    const key = sessionKey(sessionRef);
+    if (this.sessionState.loadedTranscriptKeys.has(key)) {
+      return;
+    }
+
+    const cachedTranscript = await this.readPersistedTranscript(key);
+    const transcript = cachedTranscript
+      ? await this.resolveLoadedTranscript(sessionRef, cachedTranscript)
+      : await this.driver.getTranscript(sessionRef);
+
+    if (!cachedTranscript || cachedTranscript.format === "legacy") {
+      await this.writePersistedTranscript(key, transcript);
+    }
+
+    this.sessionState.loadedTranscriptKeys.add(key);
+    this.sessionState.transcriptCache.set(key, this.mergeLoadedTranscriptWithExistingCache(key, transcript));
+  }
+
+  private mergeLoadedTranscriptWithExistingCache(
+    key: string,
+    loadedTranscript: readonly TranscriptMessage[],
+  ): TranscriptMessage[] {
+    const existingTranscript = this.sessionState.transcriptCache.get(key) ?? [];
+    if (existingTranscript.length === 0) {
+      return loadedTranscript.map(cloneTranscriptMessage);
+    }
+
+    const merged = loadedTranscript.map(cloneTranscriptMessage);
+    const loadedIds = new Set(merged.map((item) => item.id));
+    for (const item of existingTranscript) {
+      if (loadedIds.has(item.id) || hasEquivalentLoadedMessage(merged, item)) {
+        continue;
+      }
+      merged.push(cloneTranscriptMessage(item));
+    }
+    return merged;
+  }
+
+  async reloadTranscriptFromDriver(
+    sessionRef: SessionRef,
+    options: { readonly fromDisk?: boolean } = {},
+  ): Promise<void> {
+    const key = sessionKey(sessionRef);
+    const transcript = options.fromDisk
+      ? await this.driver.reloadTranscriptFromDisk(sessionRef)
+      : await this.driver.getTranscript(sessionRef);
+    this.sessionState.loadedTranscriptKeys.add(key);
+    this.sessionState.transcriptCache.set(key, transcript);
+    void this.writePersistedTranscript(key, transcript);
+    this.publishSelectedTranscriptFor(sessionRef, { replaceView: true });
+  }
+
+  private async ensureComposerAttachmentsLoaded(sessionRef: SessionRef): Promise<void> {
+    const key = sessionKey(sessionRef);
+    if (this.sessionState.composerAttachmentsBySession.has(key)) {
+      return;
+    }
+
+    const attachments = await this.attachmentStore.read(key);
+    if (attachments?.length) {
+      this.sessionState.composerAttachmentsBySession.set(key, cloneComposerAttachments(attachments));
+    }
+  }
+
+  private async ensureRuntimeLoaded(
+    workspaceId: string,
+    workspaces?: readonly { workspaceId: string; path: string; displayName: string }[],
+  ): Promise<void> {
+    if (this.runtimeByWorkspace.has(workspaceId)) {
+      return;
+    }
+
+    const ws =
+      this.workspaceRefFromState(workspaceId) ??
+      workspaces?.find((entry) => entry.workspaceId === workspaceId);
+    if (!ws) {
+      return;
+    }
+
+    const snapshot = await this.driver.runtimeSupervisor.getRuntimeSnapshot({
+      workspaceId: ws.workspaceId,
+      path: ws.path,
+      displayName: ws.displayName,
+    });
+    this.runtimeByWorkspace.set(workspaceId, snapshot);
+  }
+
+  async ensureSessionSubscribed(sessionRef: SessionRef): Promise<void> {
+    const key = sessionKey(sessionRef);
+    if (this.sessionState.sessionSubscriptions.has(key)) {
+      return;
+    }
+
+    const unsubscribe = this.driver.subscribe(sessionRef, (event) => {
+      void this.handleSessionEvent(event, key);
+    });
+    this.sessionState.sessionSubscriptions.set(key, unsubscribe);
+  }
+
+  private migrateSessionSubscriptionKey(sourceKey: string, targetKey: string): void {
+    if (sourceKey === targetKey) {
+      return;
+    }
+
+    const unsubscribe = this.sessionState.sessionSubscriptions.get(sourceKey);
+    if (!unsubscribe) {
+      return;
+    }
+
+    if (this.sessionState.sessionSubscriptions.has(targetKey)) {
+      unsubscribe();
+      this.sessionState.sessionSubscriptions.delete(sourceKey);
+      return;
+    }
+
+    this.sessionState.sessionSubscriptions.delete(sourceKey);
+    this.sessionState.sessionSubscriptions.set(targetKey, unsubscribe);
+  }
+
+  async cancelPendingDialogsForSession(
+    sessionRef: SessionRef,
+    options: { readonly force?: boolean } = {},
+  ): Promise<void> {
+    if (!options.force && this.shouldKeepSessionDialogs(sessionRef)) {
+      return;
+    }
+    const key = sessionKey(sessionRef);
+    const uiState = this.sessionState.extensionUiBySession.get(key);
+    if (!uiState || uiState.pendingDialogs.length === 0) {
+      return;
+    }
+
+    const pendingDialogs = [...uiState.pendingDialogs];
+    uiState.pendingDialogs = [];
+    this.state = this.syncDerivedSessionState(
+      {
+        ...this.state,
+        revision: this.state.revision + 1,
+      },
+      sessionRef,
+    );
+    this.emit();
+    await Promise.all(
+      pendingDialogs.map((dialog) =>
+        this.driver.respondToHostUiRequest(sessionRef, {
+          requestId: dialog.requestId,
+          cancelled: true,
+        } satisfies HostUiResponse),
+      ),
+    );
+  }
+
+  async cancelPendingDialogsWithoutVisibleWindow(
+    isSessionVisible: (sessionRef: SessionRef) => boolean,
+  ): Promise<void> {
+    await this.initialize();
+    const pendingSessionRefs: SessionRef[] = [];
+    for (const workspace of this.state.workspaces) {
+      for (const session of workspace.sessions) {
+        const sessionRef = { workspaceId: workspace.id, sessionId: session.id };
+        const uiState = this.sessionState.extensionUiBySession.get(sessionKey(sessionRef));
+        if (uiState && uiState.pendingDialogs.length > 0 && !isSessionVisible(sessionRef)) {
+          pendingSessionRefs.push(sessionRef);
+        }
+      }
+    }
+
+    await Promise.all(
+      pendingSessionRefs.map((sessionRef) => this.cancelPendingDialogsForSession(sessionRef, { force: true })),
+    );
+  }
+
+  async respondToHostUiRequest(
+    sessionRef: SessionRef,
+    response: HostUiResponse,
+  ): Promise<DesktopAppState> {
+    const key = sessionKey(sessionRef);
+    const uiState = this.sessionState.extensionUiBySession.get(key);
+    if (uiState) {
+      uiState.pendingDialogs = uiState.pendingDialogs.filter((dialog) => dialog.requestId !== response.requestId);
+    }
+
+    return this.withErrorHandling(async () => {
+      await this.driver.respondToHostUiRequest(sessionRef, response);
+      return this.refreshState({ clearLastError: true });
+    });
+  }
+
+  private async refreshSessionCommands(sessionRef: SessionRef): Promise<void> {
+    const key = sessionKey(sessionRef);
+    const commands = await this.driver.getSessionCommands(sessionRef);
+    this.sessionState.sessionCommandsBySession.set(key, [...commands]);
+  }
+
+  async refreshSessionCommandsFor(sessionRef: SessionRef): Promise<void> {
+    await this.refreshSessionCommands(sessionRef);
+  }
+
+  getLearnedRuntimeCommandCompatibility(
+    workspaceId: string,
+    command: RuntimeCommandRecord,
+  ): ExtensionCommandCompatibilityRecord | undefined {
+    return getLearnedCommandCompatibility(this.extensionCommandCompatibilityByWorkspace, workspaceId, command);
+  }
+
+  beginRuntimeCommandExecution(sessionRef: SessionRef, command: RuntimeCommandRecord): void {
+    this.pendingRuntimeCommandsBySession.set(sessionKey(sessionRef), { command });
+  }
+
+  finishRuntimeCommandExecution(
+    sessionRef: SessionRef,
+    timestamp = new Date().toISOString(),
+  ): PendingRuntimeCommandExecution | undefined {
+    const key = sessionKey(sessionRef);
+    const pending = this.pendingRuntimeCommandsBySession.get(key);
+    if (!pending) {
+      return undefined;
+    }
+
+    this.pendingRuntimeCommandsBySession.delete(key);
+    if (!pending.blockedMessage) {
+      recordLearnedCommandCompatibility(this.extensionCommandCompatibilityByWorkspace, sessionRef.workspaceId, {
+        commandName: pending.command.name,
+        extensionPath: pending.command.sourceInfo.path,
+        status: "supported",
+        message: "Observed working in pi-gui.",
+        capability: "gui-safe",
+        updatedAt: timestamp,
+      });
+    }
+
+    return pending;
+  }
+
+  clearExtensionUiForSession(sessionRef: SessionRef): void {
+    const key = sessionKey(sessionRef);
+    if (!this.sessionState.extensionUiBySession.has(key)) {
+      return;
+    }
+
+    this.sessionState.extensionUiBySession.delete(key);
+    this.state = this.syncDerivedSessionState(this.state, sessionRef);
+  }
+
+  private async refreshSessionCommandsForWorkspace(workspaceId: string): Promise<void> {
+    const sessionRefs = this.sessionRefsForWorkspace(workspaceId);
+    await Promise.all(sessionRefs.map((sessionRef) => this.refreshSessionCommands(sessionRef)));
+  }
+
+  private async reloadSessionsForWorkspace(workspaceId: string): Promise<void> {
+    const sessionRefs = this.sessionRefsForWorkspace(workspaceId);
+    await Promise.all(sessionRefs.map((sessionRef) => this.driver.reloadSession(sessionRef)));
+  }
+
+  private clearExtensionUiForWorkspace(workspaceId: string): void {
+    for (const sessionRef of this.sessionRefsForWorkspace(workspaceId)) {
+      this.clearExtensionUiForSession(sessionRef);
+    }
+  }
+
+  private reportExtensionCompatibilityIssue(
+    sessionRef: SessionRef,
+    issue: Extract<SessionDriverEvent, { type: "extensionCompatibilityIssue" }>["issue"],
+    timestamp: string,
+  ): void {
+    const key = sessionKey(sessionRef);
+    const pending = this.pendingRuntimeCommandsBySession.get(key);
+    if (pending) {
+      const message = `/${pending.command.name} requires terminal-only ${formatCapabilityLabel(issue.capability)} and is not supported in pi-gui yet. Use pi in the terminal for this command.`;
+      pending.blockedMessage = message;
+      recordLearnedCommandCompatibility(this.extensionCommandCompatibilityByWorkspace, sessionRef.workspaceId, {
+        commandName: pending.command.name,
+        extensionPath: pending.command.sourceInfo.path,
+        status: "terminal-only",
+        message,
+        capability: issue.capability,
+        updatedAt: timestamp,
+      });
+      this.sessionState.sessionErrorsBySession.set(key, message);
+      return;
+    }
+
+    const fingerprint = `${issue.extensionPath ?? "<unknown>"}:${issue.eventName ?? "<unknown>"}:${issue.capability}`;
+    const seen = this.reportedCompatibilityIssuesBySession.get(key) ?? new Set<string>();
+    if (seen.has(fingerprint)) {
+      return;
+    }
+
+    seen.add(fingerprint);
+    this.reportedCompatibilityIssuesBySession.set(key, seen);
+    this.sessionState.sessionErrorsBySession.set(key, issue.message);
+  }
+
+  private sessionRefsForWorkspace(workspaceId: string): SessionRef[] {
+    const workspace = this.state.workspaces.find((entry) => entry.id === workspaceId);
+    if (!workspace) {
+      return [];
+    }
+
+    return workspace.sessions
+      .map((session) => ({
+        workspaceId,
+        sessionId: session.id,
+      }))
+      .filter((sessionRef) => {
+        const key = sessionKey(sessionRef);
+        return (
+          (this.state.selectedWorkspaceId === workspaceId && this.state.selectedSessionId === sessionRef.sessionId) ||
+          this.sessionState.sessionCommandsBySession.has(key) ||
+          this.sessionState.sessionSubscriptions.has(key)
+        );
+      });
+  }
+
+  private getOrCreateExtensionUiState(sessionRef: SessionRef) {
+    const key = sessionKey(sessionRef);
+    const existing = this.sessionState.extensionUiBySession.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const created = createEmptyExtensionUiState();
+    this.sessionState.extensionUiBySession.set(key, created);
+    return created;
+  }
+
+  private applyHostUiRequest(event: Extract<SessionDriverEvent, { type: "hostUiRequest" }>): void {
+    const key = sessionKey(event.sessionRef);
+    if (event.request.kind === "reset") {
+      this.sessionState.extensionUiBySession.delete(key);
+      return;
+    }
+
+    const uiState = this.getOrCreateExtensionUiState(event.sessionRef);
+    applyHostUiRequestToExtensionUiState(uiState, event.request);
+
+    switch (event.request.kind) {
+      case "editorText":
+        this.sessionState.composerDraftsBySession.set(key, event.request.text);
+        this.composerDraftSyncTarget = event.sessionRef;
+        const composerDraftSyncNonce = this.allocateComposerDraftSyncNonce();
+        if (
+          this.state.selectedWorkspaceId === event.sessionRef.workspaceId &&
+          this.state.selectedSessionId === event.sessionRef.sessionId
+        ) {
+          this.state = {
+            ...this.state,
+            composerDraft: event.request.text,
+            composerDraftSyncSource: "extension-editor-text",
+            composerDraftSyncNonce,
+          };
+        } else {
+          this.state = {
+            ...this.state,
+            composerDraftSyncSource: "extension-editor-text",
+            composerDraftSyncNonce,
+          };
+        }
+        break;
+      default:
+        if (isExtensionUiDialogRequest(event.request)) {
+          const dialog = event.request;
+          uiState.pendingDialogs = [
+            ...uiState.pendingDialogs.filter((entry) => entry.requestId !== dialog.requestId),
+            dialog,
+          ];
+        }
+        break;
+    }
+  }
+
+  private async handleSessionEvent(event: SessionDriverEvent, subscriptionKey = sessionKey(event.sessionRef)): Promise<void> {
+    const key = sessionKey(event.sessionRef);
+    if (subscriptionKey !== key) {
+      this.migrateSessionSubscriptionKey(subscriptionKey, key);
+    }
+    const knownSession = this.sessionFromState(event.sessionRef);
+    const shouldFollowSessionMutation = subscriptionKey !== key && this.currentSelectedSessionKey() === subscriptionKey;
+    let refreshedFollowedSession = false;
+    if (
+      !knownSession &&
+      (event.type === "sessionOpened" ||
+        event.type === "sessionUpdated" ||
+        event.type === "runCompleted" ||
+        event.type === "hostUiRequest")
+    ) {
+      if (this.refreshStateDepth === 0) {
+        await this.refreshState({
+          selectedWorkspaceId:
+            this.state.selectedWorkspaceId === event.sessionRef.workspaceId
+              ? event.sessionRef.workspaceId
+              : this.state.selectedWorkspaceId,
+          selectedSessionId: shouldFollowSessionMutation ? event.sessionRef.sessionId : this.state.selectedSessionId,
+          clearLastError: true,
+        });
+        refreshedFollowedSession = shouldFollowSessionMutation;
+      }
+    }
+
+    switch (event.type) {
+      case "assistantDelta":
+        this.bufferAssistantDelta(event.sessionRef, event.text);
+        break;
+      case "sessionOpened":
+      case "runCompleted":
+        this.updateSessionConfig(event.sessionRef, event.snapshot.config);
+        this.updateQueuedComposerMessages(event.sessionRef, event.snapshot.queuedMessages);
+        await this.refreshSessionCommands(event.sessionRef);
+        break;
+      case "sessionUpdated":
+        this.updateSessionConfig(event.sessionRef, event.snapshot.config);
+        this.updateQueuedComposerMessages(event.sessionRef, event.snapshot.queuedMessages);
+        // sessionUpdated can fire in bursts around tool and lifecycle events.
+        // Debounce expensive state-processing (clone, emit) that is repeated
+        // for companion sessionUpdated events.
+        if (!this.scheduleDebouncedSessionUpdated(event)) {
+          return;
+        }
+        if (event.snapshot.status !== "running") {
+          await this.refreshSessionCommands(event.sessionRef);
+        }
+        break;
+      case "runFailed":
+        this.state = {
+          ...this.state,
+          lastError: event.error.message,
+        };
+        await this.refreshSessionCommands(event.sessionRef);
+        break;
+      case "extensionCompatibilityIssue":
+        this.reportExtensionCompatibilityIssue(event.sessionRef, event.issue, event.timestamp);
+        break;
+      case "sessionClosed":
+        this.sessionState.extensionUiBySession.delete(key);
+        this.sessionState.sessionCommandsBySession.delete(key);
+        this.sessionState.queuedComposerMessagesBySession.delete(key);
+        this.sessionState.queuedComposerEditsBySession.delete(key);
+        this.clearPendingAutoTitle(event.sessionRef);
+        this.pendingRuntimeCommandsBySession.delete(key);
+        this.reportedCompatibilityIssuesBySession.delete(key);
+        break;
+      case "toolStarted":
+      case "toolUpdated":
+      case "toolFinished":
+        break;
+      case "hostUiRequest":
+        this.applyHostUiRequest(event);
+        break;
+      default:
+        break;
+    }
+
+    if (event.type !== "assistantDelta") {
+      this.flushStreamingAssistantBuffer(event.sessionRef);
+    }
+
+    if (event.type === "sessionClosed") {
+      this.sessionState.sessionSubscriptions.get(key)?.();
+      this.sessionState.sessionSubscriptions.delete(key);
+      this.sessionState.deleteSession(key);
+      this.streamingAssistantBuffers.delete(key);
+      this.lastPublishedStreamingMessageBySession.delete(key);
+      // Clean up any pending debounce timers for this session
+      const timer = this.sessionUpdatedTimers.get(key);
+      if (timer) {
+        clearTimeout(timer);
+        this.sessionUpdatedTimers.delete(key);
+      }
+    }
+
+    if (event.type === "runFailed") {
+      this.sessionState.sessionErrorsBySession.set(key, event.error.message);
+    } else if (event.type === "runCompleted" || event.type === "sessionClosed") {
+      this.sessionState.sessionErrorsBySession.delete(key);
+    }
+
+    applyTimelineEvent(this.sessionState.transcriptCache, event, {
+      runMetricsBySession: this.sessionState.runMetricsBySession,
+      runningSinceBySession: this.sessionState.runningSinceBySession,
+      activeAssistantMessageBySession: this.sessionState.activeAssistantMessageBySession,
+      activeWorkingActivityBySession: this.sessionState.activeWorkingActivityBySession,
+    });
+    if (event.type !== "assistantDelta" && event.type !== "toolStarted" && event.type !== "toolUpdated" && event.type !== "toolFinished") {
+      this.state = applySessionEventState(
+        this.state,
+        event,
+        this.sessionState.transcriptCache,
+        this.sessionState.runningSinceBySession,
+        this.sessionState.lastViewedAtBySession,
+      );
+    }
+    if (event.type === "runCompleted" || event.type === "runFailed" || event.type === "hostUiRequest") {
+      this.state = {
+        ...this.state,
+        lastSessionEvent: {
+          kind: event.type,
+          workspaceId: event.sessionRef.workspaceId,
+          sessionId: event.sessionRef.sessionId,
+          timestamp: event.timestamp,
+        },
+      };
+    }
+    this.markSessionViewedIfActivelyViewed(event.sessionRef);
+    if (event.type !== "assistantDelta" && event.type !== "toolStarted" && event.type !== "toolUpdated" && event.type !== "toolFinished") {
+      this.state = this.syncDerivedSessionState(this.state, event.sessionRef);
+      this.state = this.syncDevelopmentWorkflowProjection(this.state, event.sessionRef);
+    }
+    if (shouldFollowSessionMutation && event.type !== "sessionClosed") {
+      this.applyFastSessionSelection(event.sessionRef);
+      if (!refreshedFollowedSession) {
+        this.startSelectedSessionHydration(event.sessionRef);
+      }
+    }
+    if (event.type === "assistantDelta") {
+      this.persistStreamingTranscriptCacheForSession(event.sessionRef);
+    } else if (event.type !== "hostUiRequest") {
+      this.persistTranscriptCacheForSession(event.sessionRef);
+    }
+    if (event.type === "runCompleted" || event.type === "runFailed" || event.type === "sessionClosed") {
+      await this.persistUiState();
+    } else if (event.type !== "hostUiRequest" && event.type !== "assistantDelta") {
+      this.schedulePersistUiState();
+    }
+    if (event.type !== "assistantDelta" && event.type !== "toolStarted" && event.type !== "toolUpdated" && event.type !== "toolFinished") {
+      const snapshot = this.emit();
+      await this.emitSessionEvent(event, snapshot);
+    }
+    // Throttle transcript publishing during text streaming: merge token
+    // chunks in the main process, then send a small append delta at most once
+    // per frame. The final update is guaranteed by runCompleted.
+    if (event.type === "assistantDelta") {
+      this.scheduleStreamingTranscriptPublish(event.sessionRef, "delta");
+    } else if (event.type === "toolStarted" || event.type === "toolUpdated" || event.type === "toolFinished") {
+      // Tool rows are heavier than text deltas; keep them throttled and bounded.
+      this.scheduleStreamingTranscriptPublish(event.sessionRef, "full");
+    } else if (event.type === "runCompleted" || event.type === "runFailed" || event.type === "sessionClosed") {
+      this.cancelStreamingTranscriptPublish();
+      this.publishStreamingTranscriptDelta(event.sessionRef, { force: true });
+    } else if (event.type === "sessionUpdated") {
+      // State updates are already emitted through emit(); do not full-publish
+      // transcript here or large histories/images can OOM the renderer.
+    } else {
+      this.cancelStreamingTranscriptPublish();
+      this.publishSelectedTranscriptFor(event.sessionRef);
+    }
+  }
+
+  workspaceRefFromState(workspaceId: string): WorkspaceRef | undefined {
+    const ws = this.state.workspaces.find((entry) => entry.id === workspaceId);
+    if (!ws) {
+      return undefined;
+    }
+
+    return {
+      workspaceId: ws.id,
+      path: ws.path,
+      displayName: ws.name,
+    };
+  }
+
+  private resolveModelSettingsWorkspaceId(workspaceId: string): string {
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return workspaceId;
+    }
+    return resolveRepoWorkspaceId(this.state.workspaces, workspaceId) ?? workspaceId;
+  }
+
+  private async loadLiveGlobalModelSettings(
+    workspaces: readonly { workspaceId: string; path: string; displayName: string }[],
+    preferredWorkspaceId?: string,
+  ): Promise<ModelSettingsSnapshot> {
+    const fallbackWorkspace =
+      (preferredWorkspaceId ? workspaces.find((entry) => entry.workspaceId === preferredWorkspaceId) : undefined) ?? workspaces[0];
+    if (!fallbackWorkspace) {
+      return this.state.globalModelSettings;
+    }
+    return this.driver.runtimeSupervisor.getGlobalModelSettings({
+      workspaceId: fallbackWorkspace.workspaceId,
+      path: fallbackWorkspace.path,
+      displayName: fallbackWorkspace.displayName,
+    });
+  }
+
+  async buildCreateSessionOptions(workspaceId: string): Promise<CreateSessionOptions | undefined> {
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return undefined;
+    }
+    const effectiveSettings = await this.loadEffectiveModelSettingsForWorkspace(workspaceId);
+    if (!effectiveSettings) {
+      return undefined;
+    }
+    return {
+      ...(effectiveSettings.defaultProvider && effectiveSettings.defaultModelId
+        ? { initialModel: { provider: effectiveSettings.defaultProvider, modelId: effectiveSettings.defaultModelId } }
+        : {}),
+      ...(effectiveSettings.defaultThinkingLevel ? { initialThinkingLevel: effectiveSettings.defaultThinkingLevel } : {}),
+    };
+  }
+
+  private serializeRuntimeState(): Record<string, RuntimeSnapshot> {
+    return serializeRuntimeByWorkspaceForRenderer(this.runtimeByWorkspace);
+  }
+
+  private async serializeRuntimeStateForCurrentWorkspaces(): Promise<Record<string, RuntimeSnapshot>> {
+    const runtimeByWorkspace = this.serializeRuntimeState();
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return runtimeByWorkspace;
+    }
+
+    const workspaceRefs = this.state.workspaces.map((workspace) => ({
+      workspaceId: workspace.id,
+      path: workspace.path,
+      displayName: workspace.name,
+    }));
+    const scopedModelSettingsByWorkspace = await this.loadScopedModelSettingsByWorkspace(
+      this.state.workspaces,
+      workspaceRefs,
+      this.state.globalModelSettings,
+    );
+    return this.serializeEffectiveRuntimeState(this.state.workspaces, scopedModelSettingsByWorkspace);
+  }
+
+  private async loadScopedModelSettingsByWorkspace(
+    workspaces: DesktopAppState["workspaces"],
+    workspaceRefs: readonly { workspaceId: string; path: string; displayName: string }[],
+    globalModelSettings: ModelSettingsSnapshot,
+  ): Promise<Record<string, ModelSettingsSnapshot>> {
+    const uniqueOwnerIds = [...new Set(workspaces.map((workspace) => resolveRepoWorkspaceId(workspaces, workspace.id) ?? workspace.id))];
+    const refsByWorkspaceId = new Map(workspaceRefs.map((workspace) => [workspace.workspaceId, workspace] as const));
+    const ownerSettings = await Promise.all(
+      uniqueOwnerIds.map(async (workspaceId) => {
+        const workspace = refsByWorkspaceId.get(workspaceId);
+        if (!workspace) {
+          return undefined;
+        }
+        return [
+          workspaceId,
+          mergeModelSettingsSnapshot(globalModelSettings, await readProjectModelSettingsFile(workspace.path)),
+        ] as const;
+      }),
+    );
+
+    return Object.fromEntries(ownerSettings.filter((entry): entry is readonly [string, ModelSettingsSnapshot] => Boolean(entry)));
+  }
+
+  private serializeEffectiveRuntimeState(
+    workspaces: DesktopAppState["workspaces"],
+    scopedModelSettingsByWorkspace?: Record<string, ModelSettingsSnapshot>,
+  ): Record<string, RuntimeSnapshot> {
+    const runtimeByWorkspace = this.serializeRuntimeState();
+    if (this.state.modelSettingsScopeMode !== "per-repo") {
+      return runtimeByWorkspace;
+    }
+
+    for (const workspace of workspaces) {
+      const ownerWorkspaceId = resolveRepoWorkspaceId(workspaces, workspace.id);
+      const workspaceRuntime = runtimeByWorkspace[workspace.id];
+      const modelSettings = ownerWorkspaceId ? scopedModelSettingsByWorkspace?.[ownerWorkspaceId] : undefined;
+      if (!workspaceRuntime || !modelSettings) {
+        continue;
+      }
+      runtimeByWorkspace[workspace.id] = applyModelSettingsSnapshot(workspaceRuntime, modelSettings);
+    }
+
+    return runtimeByWorkspace;
+  }
+
+  private serializeSessionExtensionUiState() {
+    return Object.fromEntries(
+      [...this.sessionState.extensionUiBySession.entries()].map(([key, value]) => [key, serializeExtensionUiState(value)] as const),
+    );
+  }
+
+  private syncDerivedSessionState(state: DesktopAppState, sessionRef: SessionRef): DesktopAppState {
+    const key = sessionKey(sessionRef);
+    const serializedExtensionUi = this.sessionState.extensionUiBySession.get(key);
+
+    return {
+      ...state,
+      sessionCommandsBySession: updateRecordValue(
+        state.sessionCommandsBySession,
+        key,
+        serializeSessionCommandsForRenderer(this.sessionState.sessionCommandsBySession.get(key)),
+      ),
+      sessionExtensionUiBySession: updateRecordValue(
+        state.sessionExtensionUiBySession,
+        key,
+        serializedExtensionUi ? serializeExtensionUiState(serializedExtensionUi) : undefined,
+      ),
+      extensionCommandCompatibilityByWorkspace: serializeCompatibilityByWorkspace(this.extensionCommandCompatibilityByWorkspace),
+      lastViewedAtBySession: updateRecordValue(
+        state.lastViewedAtBySession,
+        key,
+        this.sessionState.lastViewedAtBySession.get(key),
+      ),
+      queuedComposerMessages: this.resolveQueuedComposerMessages(state.selectedWorkspaceId, state.selectedSessionId),
+      editingQueuedMessageId: this.resolveEditingQueuedMessageId(state.selectedWorkspaceId, state.selectedSessionId),
+      lastError: this.resolveSelectedSessionError(state.selectedWorkspaceId, state.selectedSessionId, false),
+    };
+  }
+
+  selectedSessionRef(): SessionRef | undefined {
+    if (!this.state.selectedWorkspaceId || !this.state.selectedSessionId) {
+      return undefined;
+    }
+
+    return toSessionRef({
+      workspaceId: this.state.selectedWorkspaceId,
+      sessionId: this.state.selectedSessionId,
+    });
+  }
+
+  private selectedSessionRefForView(view: DesktopAppViewState): SessionRef | undefined {
+    const selectedWorkspaceId = this.resolveViewWorkspaceId(view.selectedWorkspaceId, this.state);
+    const selectedSessionId = this.resolveViewSessionId(selectedWorkspaceId, view.selectedSessionId, this.state);
+    if (!selectedWorkspaceId || !selectedSessionId) {
+      return undefined;
+    }
+
+    return toSessionRef({
+      workspaceId: selectedWorkspaceId,
+      sessionId: selectedSessionId,
+    });
+  }
+
+  private resolveViewWorkspaceId(
+    preferredWorkspaceId: string | undefined,
+    state: DesktopAppState,
+  ): string {
+    if (preferredWorkspaceId && state.workspaces.some((workspace) => workspace.id === preferredWorkspaceId)) {
+      return preferredWorkspaceId;
+    }
+    if (state.selectedWorkspaceId && state.workspaces.some((workspace) => workspace.id === state.selectedWorkspaceId)) {
+      return state.selectedWorkspaceId;
+    }
+    return state.workspaces[0]?.id ?? "";
+  }
+
+  private resolveViewSessionId(
+    selectedWorkspaceId: string,
+    preferredSessionId: string | undefined,
+    state: DesktopAppState,
+  ): string {
+    const workspace = state.workspaces.find((entry) => entry.id === selectedWorkspaceId);
+    if (!workspace) {
+      return "";
+    }
+    if (preferredSessionId && workspace.sessions.some((session) => session.id === preferredSessionId)) {
+      return preferredSessionId;
+    }
+    if (state.selectedWorkspaceId === selectedWorkspaceId && workspace.sessions.some((session) => session.id === state.selectedSessionId)) {
+      return state.selectedSessionId;
+    }
+    return workspace.sessions[0]?.id ?? "";
+  }
+
+  sessionFromState(sessionRef: SessionRef) {
+    return this.state.workspaces
+      .find((w) => w.id === sessionRef.workspaceId)
+      ?.sessions.find((s) => s.id === sessionRef.sessionId);
+  }
+
+  private async loadEffectiveModelSettingsForWorkspace(workspaceId: string): Promise<ModelSettingsSnapshot | undefined> {
+    const ownerWorkspaceId = this.resolveModelSettingsWorkspaceId(workspaceId);
+    const ownerWorkspace = this.workspaceRefFromState(ownerWorkspaceId);
+    if (!ownerWorkspace) {
+      return undefined;
+    }
+    const globalModelSettings =
+      this.state.modelSettingsScopeMode === "per-repo" && hasStoredModelSettings(this.state.globalModelSettings)
+        ? this.state.globalModelSettings
+        : await this.loadLiveGlobalModelSettings(
+            this.state.workspaces.map((workspace) => ({
+              workspaceId: workspace.id,
+              path: workspace.path,
+              displayName: workspace.name,
+            })),
+            ownerWorkspaceId,
+          );
+    return mergeModelSettingsSnapshot(globalModelSettings, await readProjectModelSettingsFile(ownerWorkspace.path));
+  }
+
+  private async restoreGlobalModelSettings(
+    settings: ModelSettingsSnapshot,
+    workspaces?: readonly { workspaceId: string; path: string; displayName: string }[],
+    preferredWorkspaceId?: string,
+  ): Promise<void> {
+    if (!hasStoredModelSettings(settings)) {
+      return;
+    }
+    const workspaceRefs =
+      workspaces ??
+      this.state.workspaces.map((workspace) => ({
+        workspaceId: workspace.id,
+        path: workspace.path,
+        displayName: workspace.name,
+      }));
+    const fallbackWorkspace =
+      (preferredWorkspaceId ? workspaceRefs.find((entry) => entry.workspaceId === preferredWorkspaceId) : undefined) ??
+      workspaceRefs[0];
+    if (!fallbackWorkspace) {
+      return;
+    }
+    const workspaceRef = {
+      workspaceId: fallbackWorkspace.workspaceId,
+      path: fallbackWorkspace.path,
+      displayName: fallbackWorkspace.displayName,
+    };
+    await this.driver.runtimeSupervisor.setScopedModelPatterns(workspaceRef, settings.enabledModelPatterns);
+    if (settings.defaultThinkingLevel) {
+      await this.driver.runtimeSupervisor.setDefaultThinkingLevel(workspaceRef, settings.defaultThinkingLevel);
+    }
+    if (settings.defaultProvider && settings.defaultModelId) {
+      await this.driver.runtimeSupervisor.setDefaultModel(workspaceRef, {
+        provider: settings.defaultProvider,
+        modelId: settings.defaultModelId,
+      });
+    }
+    if (this.runtimeByWorkspace.has(workspaceRef.workspaceId)) {
+      this.runtimeByWorkspace.set(workspaceRef.workspaceId, await this.driver.runtimeSupervisor.refreshRuntime(workspaceRef));
+    }
+  }
+
+  private async readUiState(): Promise<LegacyPersistedUiState> {
+    return readPersistedUiState(this.uiStateFilePath);
+  }
+
+  async persistUiState(): Promise<void> {
+    if (this.persistUiStateTimer) {
+      clearTimeout(this.persistUiStateTimer);
+      this.persistUiStateTimer = undefined;
+    }
+    const payload: PersistedUiState = {
+      selectedWorkspaceId: this.state.selectedWorkspaceId || undefined,
+      selectedSessionId: this.state.selectedSessionId || undefined,
+      activeView: this.state.activeView,
+      composerDraft: this.state.composerDraft || undefined,
+      composerDraftsBySession: mapToRecord(this.sessionState.composerDraftsBySession),
+      extensionCommandCompatibilityByWorkspace: serializeCompatibilityByWorkspace(this.extensionCommandCompatibilityByWorkspace),
+      notificationPreferences: this.state.notificationPreferences,
+      mobileSync: this.state.mobileSync,
+      difyConfig: this.state.difyConfig,
+      cliTools: this.state.cliTools,
+      integratedTerminalShell: this.state.integratedTerminalShell || undefined,
+      lastViewedAtBySession: mapToRecord(this.sessionState.lastViewedAtBySession),
+      workspaceOrder: this.state.workspaceOrder.length > 0 ? this.state.workspaceOrder : undefined,
+      modelSettingsScopeMode: this.state.modelSettingsScopeMode,
+      appGlobalModelSettings: hasStoredModelSettings(this.state.globalModelSettings) ? this.state.globalModelSettings : undefined,
+      sidebarCollapsed: this.state.sidebarCollapsed || undefined,
+      sidebarTab: this.state.sidebarTab,
+      appearanceTheme: this.state.appearanceTheme,
+      conversationGroups: this.state.conversationGroups.length > 0 ? this.state.conversationGroups : undefined,
+      enableTransparency: this.state.enableTransparency,
+      backgroundGradientIntensity: this.state.backgroundGradientIntensity,
+      componentDock: this.state.componentDock,
+      sessionCategoriesByWorkspace: this.state.sessionCategoriesByWorkspace,
+      appMode: this.state.appMode === "development" ? "development" : undefined,
+      developmentModePresets: this.state.developmentModePresets.length > 0 ? this.state.developmentModePresets : undefined,
+      activeDevelopmentModePresetId: this.state.activeDevelopmentModePresetId,
+    };
+
+    await writePersistedUiState(this.uiStateFilePath, payload);
+  }
+
+  async persistComposerAttachments(
+    key: string,
+    attachments: readonly ComposerAttachment[],
+  ): Promise<void> {
+    await this.attachmentStore.write(key, cloneComposerAttachments(attachments));
+    await this.persistUiState();
+  }
+
+  persistTranscriptCacheForSession(sessionRef: SessionRef): void {
+    const key = sessionKey(sessionRef);
+    const existing = this.transcriptPersistTimers.get(key);
+    if (existing) {
+      clearTimeout(existing);
+    }
+
+    const timer = setTimeout(() => {
+      this.transcriptPersistTimers.delete(key);
+      this.flushStreamingAssistantBuffer(sessionRef);
+      const transcript = (this.sessionState.transcriptCache.get(key) ?? []).map(cloneTranscriptMessage);
+      void this.writePersistedTranscript(key, transcript);
+    }, 250);
+
+    this.transcriptPersistTimers.set(key, timer);
+  }
+
+  private persistStreamingTranscriptCacheForSession(sessionRef: SessionRef): void {
+    const key = sessionKey(sessionRef);
+    if (this.transcriptPersistTimers.has(key)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.transcriptPersistTimers.delete(key);
+      this.flushStreamingAssistantBuffer(sessionRef);
+      const transcript = (this.sessionState.transcriptCache.get(key) ?? []).map(cloneTranscriptMessage);
+      void this.writePersistedTranscript(key, transcript);
+    }, 1_000);
+
+    this.transcriptPersistTimers.set(key, timer);
+  }
+
+  private async readPersistedTranscript(
+    key: string,
+  ): Promise<
+    | {
+        readonly format: "versioned" | "legacy";
+        readonly transcript: TranscriptMessage[];
+      }
+    | null
+  > {
+    const persisted = await this.transcriptStore.read(key);
+    if (!persisted) {
+      return null;
+    }
+
+    if (isPersistedTranscriptRecord(persisted)) {
+      return {
+        format: "versioned",
+        transcript: persisted.transcript.map((item) => cloneTranscriptMessage(item as TranscriptMessage)),
+      };
+    }
+
+    if (Array.isArray(persisted)) {
+      return {
+        format: "legacy",
+        transcript: persisted.map((item) => cloneTranscriptMessage(item as TranscriptMessage)),
+      };
+    }
+
+    return null;
+  }
+
+  private async resolveLoadedTranscript(
+    sessionRef: SessionRef,
+    persisted: {
+      readonly format: "versioned" | "legacy";
+      readonly transcript: TranscriptMessage[];
+    },
+  ): Promise<TranscriptMessage[]> {
+    const driverTranscript = await this.driver.getTranscript(sessionRef);
+    if (driverTranscript.length > 0) {
+      return driverTranscript;
+    }
+
+    return persisted.transcript;
+  }
+
+  private isPossiblyTrimmedLegacyTranscript(transcript: readonly TranscriptMessage[]): boolean {
+    return transcript.length === LEGACY_TRANSCRIPT_HISTORY_LIMIT;
+  }
+
+  private async writePersistedTranscript(key: string, transcript: readonly TranscriptMessage[]): Promise<void> {
+    await this.transcriptStore.write(key, {
+      version: 1,
+      transcript: transcript.map(cloneTranscriptMessage),
+    });
+  }
+
+  schedulePersistUiState(): void {
+    if (this.persistUiStateTimer) {
+      clearTimeout(this.persistUiStateTimer);
+    }
+
+    this.persistUiStateTimer = setTimeout(() => {
+      this.persistUiStateTimer = undefined;
+      void this.persistUiState();
+    }, 250);
+  }
+
+  private currentSelectedSessionKey(): string {
+    return this.state.selectedWorkspaceId && this.state.selectedSessionId
+      ? sessionKey({
+          workspaceId: this.state.selectedWorkspaceId,
+          sessionId: this.state.selectedSessionId,
+        })
+      : "";
+  }
+
+  private isSelectedSession(sessionRef: SessionRef): boolean {
+    const selected = this.selectedSessionRef();
+    return Boolean(
+      selected &&
+      selected.workspaceId === sessionRef.workspaceId &&
+      selected.sessionId === sessionRef.sessionId,
+    );
+  }
+
+  private bufferAssistantDelta(sessionRef: SessionRef, text: string): void {
+    if (!text) return;
+    const key = sessionKey(sessionRef);
+    const existing = this.streamingAssistantBuffers.get(key);
+    if (existing) {
+      existing.chunks.push(text);
+      return;
+    }
+    this.streamingAssistantBuffers.set(key, {
+      sessionRef: { ...sessionRef },
+      chunks: [text],
+    });
+  }
+
+  private flushStreamingAssistantBuffer(sessionRef: SessionRef): void {
+    const key = sessionKey(sessionRef);
+    const buffer = this.streamingAssistantBuffers.get(key);
+    if (!buffer || buffer.chunks.length === 0) return;
+    this.streamingAssistantBuffers.delete(key);
+    appendAssistantDelta(
+      this.sessionState.transcriptCache,
+      this.sessionState.activeAssistantMessageBySession,
+      buffer.sessionRef,
+      buffer.chunks.join(""),
+    );
+  }
+
+  private buildSelectedTranscriptRecord(
+    sessionRef: SessionRef,
+    options: { readonly startIndex?: number; readonly limit?: number; readonly replaceView?: boolean } = {},
+  ): SelectedTranscriptRecord {
+    this.flushStreamingAssistantBuffer(sessionRef);
+    const transcript = this.sessionState.transcriptCache.get(sessionKey(sessionRef)) ?? [];
+    this.markLatestAssistantMessagePublished(sessionRef, transcript);
+    const totalCount = transcript.length;
+    const limit = Math.max(0, Math.min(options.limit ?? SELECTED_TRANSCRIPT_RENDER_LIMIT, SELECTED_TRANSCRIPT_RENDER_LIMIT));
+    const defaultStartIndex = Math.max(0, totalCount - limit);
+    const startIndex = Math.max(0, Math.min(options.startIndex ?? defaultStartIndex, totalCount));
+    const endIndex = Math.min(totalCount, startIndex + limit);
+    const renderTranscript = transcript.slice(startIndex, endIndex);
+    return {
+      workspaceId: sessionRef.workspaceId,
+      sessionId: sessionRef.sessionId,
+      transcript: renderTranscript.map((message) => cloneTranscriptMessageForRenderer(message)),
+      startIndex,
+      totalCount,
+      ...(options.replaceView ? { replaceView: true } : {}),
+    };
+  }
+
+  private markLatestAssistantMessagePublished(sessionRef: SessionRef, transcript: readonly TranscriptMessage[]): void {
+    const key = sessionKey(sessionRef);
+    for (let i = transcript.length - 1; i >= 0; i -= 1) {
+      const entry = transcript[i];
+      if (entry?.kind !== "message" || entry.role !== "assistant") continue;
+      this.lastPublishedStreamingMessageBySession.set(key, {
+        messageId: entry.id,
+        textLength: entry.text.length,
+      });
+      return;
+    }
+  }
+
+  emit(): DesktopAppState {
+    const snapshot = structuredClone(this.state);
+    for (const listener of this.listeners) {
+      listener(snapshot);
+    }
+    return snapshot;
+  }
+
+  publishSelectedTranscript(options?: { readonly startIndex?: number; readonly limit?: number; readonly replaceView?: boolean }): void {
+    const sessionRef = this.selectedSessionRef();
+    const payload = sessionRef ? this.buildSelectedTranscriptRecord(sessionRef, options) : null;
+    for (const listener of this.selectedTranscriptListeners) {
+      listener(payload);
+    }
+  }
+
+  publishSelectedTranscriptFor(sessionRef: SessionRef, options?: { readonly startIndex?: number; readonly limit?: number; readonly replaceView?: boolean }): void {
+    if (!this.isSelectedSession(sessionRef)) {
+      return;
+    }
+    this.publishSelectedTranscript(options);
+  }
+
+  publishTranscriptMessagePatch(sessionRef: SessionRef, message: Extract<TranscriptMessage, { kind: "message" }>): void {
+    if (!this.isSelectedSession(sessionRef)) return;
+    const delta = {
+      workspaceId: sessionRef.workspaceId,
+      sessionId: sessionRef.sessionId,
+      messageId: message.id,
+      replaceMessage: cloneTranscriptMessageForRenderer(message) as TranscriptMessageRow,
+    };
+    for (const listener of this.selectedTranscriptDeltaListeners) {
+      listener(delta);
+    }
+  }
+
+  private readonly STREAMING_PUBLISH_INTERVAL_MS = 33;
+
+  private scheduleStreamingTranscriptPublish(sessionRef: SessionRef, mode: "delta" | "full"): void {
+    if (!this.isSelectedSession(sessionRef)) {
+      return;
+    }
+    // Full publish always wins — if a delta timer is pending and a tool
+    // event arrives, cancel the delta and schedule a full publish.
+    if (mode === "full" && this.streamingTranscriptPublishTimer) {
+      clearTimeout(this.streamingTranscriptPublishTimer);
+      this.streamingTranscriptPublishTimer = undefined;
+    }
+    if (!this.streamingTranscriptPublishTimer) {
+      this.streamingTranscriptPublishTimer = setTimeout(() => {
+        this.streamingTranscriptPublishTimer = undefined;
+        if (mode === "delta") {
+          this.publishStreamingTranscriptDelta(sessionRef);
+        } else {
+          this.publishSelectedTranscriptFor(sessionRef);
+        }
+      }, this.STREAMING_PUBLISH_INTERVAL_MS);
+    }
+  }
+
+  private publishStreamingTranscriptDelta(sessionRef: SessionRef, options: { readonly force?: boolean } = {}): void {
+    if (!this.isSelectedSession(sessionRef)) return;
+    this.flushStreamingAssistantBuffer(sessionRef);
+    const key = sessionKey(sessionRef);
+    const transcript = this.sessionState.transcriptCache.get(key);
+    if (!transcript || transcript.length === 0) return;
+    // Find the last assistant message — the one that is currently streaming.
+    for (let i = transcript.length - 1; i >= 0; i -= 1) {
+      const entry = transcript[i];
+      if (entry?.kind !== "message" || entry.role !== "assistant") continue;
+
+      const previous = this.lastPublishedStreamingMessageBySession.get(key);
+      const mode = resolveRendererStreamingPublishMode(previous, entry.id, entry.text.length, options);
+      if (mode === "skip") return;
+
+      const textDelta = mode === "append" ? entry.text.slice(previous?.textLength ?? 0) : undefined;
+      if (mode === "append" && !textDelta) return;
+
+      this.lastPublishedStreamingMessageBySession.set(key, {
+        messageId: entry.id,
+        textLength: entry.text.length,
+      });
+      const delta = {
+        workspaceId: sessionRef.workspaceId,
+        sessionId: sessionRef.sessionId,
+        messageId: entry.id,
+        ...(mode === "append"
+          ? { textDelta }
+          : { replaceMessage: cloneTranscriptMessageForRenderer(entry) as TranscriptMessageRow }),
+      };
+      for (const listener of this.selectedTranscriptDeltaListeners) {
+        listener(delta);
+      }
+      return;
+    }
+  }
+
+  private cancelStreamingTranscriptPublish(): void {
+    if (this.streamingTranscriptPublishTimer) {
+      clearTimeout(this.streamingTranscriptPublishTimer);
+      this.streamingTranscriptPublishTimer = undefined;
+    }
+  }
+
+  /**
+   * Returns true if the sessionUpdated event should be processed now.
+   * Debounces bursty sessionUpdated events (emitted alongside tool/delta
+   * events) to a single state update per 200 ms.
+   * Title mutations (rename, auto-title) bypass coalescing so the rendered
+   * state reflects the change immediately.
+   */
+  private scheduleDebouncedSessionUpdated(event: SessionDriverEvent): boolean {
+    // Only debounce for the active session.
+    if (!this.isSelectedSession(event.sessionRef)) return true;
+    const key = sessionKey(event.sessionRef);
+    if (this.sessionUpdatedTimers.has(key)) {
+      // Title mutations (rename, auto-title) must bypass coalescing.
+      const currentTitle = this.sessionFromState(event.sessionRef)?.title;
+      if ('snapshot' in event && currentTitle !== event.snapshot.title) {
+        return true;
+      }
+      // A timer already exists; skip this event.
+      return false;
+    }
+    this.sessionUpdatedTimers.set(key, setTimeout(() => {
+      this.sessionUpdatedTimers.delete(key);
+    }, 200));
+    return true;
+  }
+
+  handleWindowActivation(): void {
+    if (!this.markSelectedSessionViewedIfVisible()) {
+      return;
+    }
+
+    this.schedulePersistUiState();
+    this.emit();
+  }
+
+  private async emitSessionEvent(event: SessionDriverEvent, snapshot: DesktopAppState): Promise<void> {
+    for (const listener of this.sessionEventListeners) {
+      await listener(event, snapshot);
+    }
+  }
+
+  async withError(error: unknown): Promise<DesktopAppState> {
+    const message = error instanceof Error ? error.message : String(error);
+    const sessionRef = this.selectedSessionRef();
+    if (sessionRef) {
+      this.sessionState.sessionErrorsBySession.set(sessionKey(sessionRef), message);
+    }
+    this.state = {
+      ...this.state,
+      lastError: message,
+      revision: this.state.revision + 1,
+    };
+    await this.persistUiState();
+    return this.emit();
+  }
+
+  async withErrorHandling(fn: () => Promise<DesktopAppState>): Promise<DesktopAppState> {
+    try {
+      return await fn();
+    } catch (error) {
+      return this.withError(error);
+    }
+  }
+
+  private applyFastSessionSelection(sessionRef: SessionRef): DesktopAppState {
+    this.cancelStreamingTranscriptPublish();
+    this.restoredSelectedSessionKeysAwaitingSelection.delete(sessionKey(sessionRef));
+    this.state = {
+      ...this.state,
+      selectedWorkspaceId: sessionRef.workspaceId,
+      selectedSessionId: sessionRef.sessionId,
+      activeView: "threads",
+      composerDraft: this.resolveComposerDraft(sessionRef.workspaceId, sessionRef.sessionId),
+      composerDraftSyncSource: "selection",
+      composerDraftSyncNonce: this.allocateComposerDraftSyncNonce(),
+      composerAttachments: this.resolveComposerAttachments(sessionRef.workspaceId, sessionRef.sessionId),
+      lastError: undefined,
+      revision: this.state.revision + 1,
+    };
+    this.markSessionViewed(sessionRef);
+    this.schedulePersistUiState();
+    const snapshot = this.emit();
+    if (this.sessionState.loadedTranscriptKeys.has(sessionKey(sessionRef))) {
+      this.publishSelectedTranscript();
+    }
+    return snapshot;
+  }
+
+  private async hydrateSelectedSessionAfterSelection(
+    sessionRef: SessionRef,
+    selectionEpoch: number,
+    options: { readonly markViewed?: boolean } = {},
+  ): Promise<void> {
+    const runtimeMissing = !this.runtimeByWorkspace.has(sessionRef.workspaceId);
+    const [snapshot] = await Promise.all([
+      this.ensureSessionReady(sessionRef),
+      this.ensureComposerAttachmentsLoaded(sessionRef),
+      runtimeMissing ? this.ensureRuntimeLoaded(sessionRef.workspaceId) : Promise.resolve(),
+    ]);
+
+    if (!this.isCurrentSelectionEpoch(sessionRef, selectionEpoch)) {
+      return;
+    }
+
+    const runtimeByWorkspace = runtimeMissing ? await this.serializeRuntimeStateForCurrentWorkspaces() : undefined;
+    if (!this.isCurrentSelectionEpoch(sessionRef, selectionEpoch)) {
+      return;
+    }
+
+    this.clearSessionError(sessionRef);
+    this.state = this.syncSelectedSessionHydrationState(this.state, sessionRef, snapshot, runtimeByWorkspace);
+    if (options.markViewed ?? true) {
+      this.markSessionViewed(sessionRef);
+    }
+    this.schedulePersistUiState();
+    this.emit();
+    this.publishSelectedTranscriptFor(sessionRef);
+  }
+
+  private startSelectedSessionHydration(
+    sessionRef: SessionRef | undefined,
+    options: { readonly markViewed?: boolean } = {},
+  ): void {
+    if (!sessionRef) {
+      return;
+    }
+
+    const selectionEpoch = ++this.selectionEpoch;
+    void this.hydrateSelectedSessionAfterSelection(sessionRef, selectionEpoch, options).catch((error: unknown) => {
+      void this.handleSelectedSessionHydrationError(sessionRef, selectionEpoch, error);
+    });
+  }
+
+  private async handleSelectedSessionHydrationError(
+    sessionRef: SessionRef,
+    selectionEpoch: number,
+    error: unknown,
+  ): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    this.sessionState.sessionErrorsBySession.set(sessionKey(sessionRef), message);
+    if (this.isCurrentSelectionEpoch(sessionRef, selectionEpoch)) {
+      await this.withError(error);
+      return;
+    }
+
+    this.schedulePersistUiState();
+  }
+
+  private isCurrentSelectionEpoch(sessionRef: SessionRef, selectionEpoch: number): boolean {
+    return (
+      selectionEpoch === this.selectionEpoch &&
+      this.state.selectedWorkspaceId === sessionRef.workspaceId &&
+      this.state.selectedSessionId === sessionRef.sessionId
+    );
+  }
+
+  private markSelectedSessionViewedIfVisible(): boolean {
+    if (this.state.activeView !== "threads" || !this.state.selectedWorkspaceId || !this.state.selectedSessionId) {
+      return false;
+    }
+
+    const sessionRef = {
+      workspaceId: this.state.selectedWorkspaceId,
+      sessionId: this.state.selectedSessionId,
+    } satisfies SessionRef;
+    if (!isSessionVisibleInWindow(this.state, sessionRef, this.getWindow())) {
+      return false;
+    }
+    if (this.restoredSelectedSessionKeysAwaitingSelection.has(sessionKey(sessionRef))) {
+      return false;
+    }
+
+    return this.markSessionViewed(sessionRef);
+  }
+
+  private markSessionViewedIfActivelyViewed(sessionRef: SessionRef): boolean {
+    const active = isSessionActivelyViewed(this.state, sessionRef, this.getWindow());
+    if (!active) {
+      return false;
+    }
+
+    return this.markSessionViewed(sessionRef);
+  }
+
+  private markSessionViewed(sessionRef: SessionRef, fallbackViewedAt = new Date().toISOString()): boolean {
+    const key = sessionKey(sessionRef);
+    const viewedAt = this.resolveViewedAt(sessionRef, fallbackViewedAt);
+    const current = this.sessionState.lastViewedAtBySession.get(key);
+    if (current && current >= viewedAt) {
+      return false;
+    }
+
+    this.sessionState.lastViewedAtBySession.set(key, viewedAt);
+    this.state = {
+      ...this.state,
+      workspaces: this.state.workspaces.map((w) =>
+        w.id === sessionRef.workspaceId
+          ? {
+              ...w,
+              sessions: w.sessions.map((s) =>
+                s.id === sessionRef.sessionId
+                  ? {
+                      ...s,
+                      lastViewedAt: viewedAt,
+                      hasUnseenUpdate: false,
+                    }
+                  : s,
+              ),
+            }
+          : w,
+      ),
+      lastViewedAtBySession: mapToRecord(this.sessionState.lastViewedAtBySession),
+    };
+    return true;
+  }
+
+  private resolveViewedAt(sessionRef: SessionRef, fallbackViewedAt: string): string {
+    const session = this.findSessionRecord(sessionRef);
+    if (!session) {
+      return fallbackViewedAt;
+    }
+
+    const activityAt = latestSessionActivityAt(
+      session.updatedAt,
+      this.sessionState.transcriptCache.get(sessionKey(sessionRef)) ?? [],
+    );
+    return activityAt > fallbackViewedAt ? activityAt : fallbackViewedAt;
+  }
+
+  private findSessionRecord(sessionRef: SessionRef) {
+    return this.state.workspaces
+      .find((workspace) => workspace.id === sessionRef.workspaceId)
+      ?.sessions.find((session) => session.id === sessionRef.sessionId);
+  }
+
+  private clearSessionError(sessionRef: SessionRef): void {
+    this.sessionState.sessionErrorsBySession.delete(sessionKey(sessionRef));
+  }
+
+  private resolveComposerDraft(
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+    explicitDraft?: string,
+  ): string {
+    if (explicitDraft !== undefined) {
+      if (selectedWorkspaceId && selectedSessionId) {
+        const key = sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId });
+        if (explicitDraft) {
+          this.sessionState.composerDraftsBySession.set(key, explicitDraft);
+        } else {
+          this.sessionState.composerDraftsBySession.delete(key);
+        }
+      }
+      return explicitDraft;
+    }
+
+    if (!selectedWorkspaceId || !selectedSessionId) {
+      return "";
+    }
+
+    return this.sessionState.composerDraftsBySession.get(sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId })) ?? "";
+  }
+
+  private resolveComposerDraftSync(
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+    options: RefreshStateOptions,
+  ): {
+    readonly source: ComposerDraftSyncSource;
+    readonly nonce: number;
+  } {
+    if (options.composerDraftSyncSource) {
+      return {
+        source: options.composerDraftSyncSource,
+        nonce: this.allocateComposerDraftSyncNonce(),
+      };
+    }
+
+    if (
+      selectedWorkspaceId !== this.state.selectedWorkspaceId ||
+      selectedSessionId !== this.state.selectedSessionId
+    ) {
+      return {
+        source: "selection",
+        nonce: this.allocateComposerDraftSyncNonce(),
+      };
+    }
+
+    return {
+      source: this.state.composerDraftSyncSource,
+      nonce: this.state.composerDraftSyncNonce,
+    };
+  }
+
+  allocateComposerDraftSyncNonce(baseNonce = this.state.composerDraftSyncNonce): number {
+    this.composerDraftProjectionNonce = Math.max(this.composerDraftProjectionNonce, baseNonce) + 1;
+    return this.composerDraftProjectionNonce;
+  }
+
+  private resolveComposerAttachments(
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+  ): readonly ComposerAttachment[] {
+    if (!selectedWorkspaceId || !selectedSessionId) {
+      return [];
+    }
+
+    return cloneComposerAttachmentsForRenderer(
+      this.sessionState.composerAttachmentsBySession.get(
+        sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId }),
+      ) ?? [],
+    );
+  }
+
+  private resolveQueuedComposerMessages(
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+  ): readonly QueuedComposerMessage[] {
+    if (!selectedWorkspaceId || !selectedSessionId) {
+      return [];
+    }
+
+    return cloneQueuedComposerMessagesForRenderer(
+      this.sessionState.queuedComposerMessagesBySession.get(
+        sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId }),
+      )?.filter((message) => message.mode === "followUp") ?? [],
+    );
+  }
+
+  private resolveEditingQueuedMessageId(
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+  ): string | undefined {
+    if (!selectedWorkspaceId || !selectedSessionId) {
+      return undefined;
+    }
+
+    return this.sessionState.queuedComposerEditsBySession.get(
+      sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId }),
+    )?.messageId;
+  }
+
+  private syncDevelopmentWorkflowProjection(state: DesktopAppState, sessionRef: SessionRef): DesktopAppState {
+    if (state.selectedWorkspaceId !== sessionRef.workspaceId || state.selectedSessionId !== sessionRef.sessionId) {
+      return state;
+    }
+    return {
+      ...state,
+      developmentWorkflowProjection: this.resolveDevelopmentWorkflowProjection(state, state.selectedWorkspaceId, state.selectedSessionId),
+    };
+  }
+
+  private resolveDevelopmentWorkflowProjection(
+    state: DesktopAppState,
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+  ): DesktopAppState["developmentWorkflowProjection"] {
+    if (state.appMode !== "development" || !state.activeDevelopmentModePresetId || !selectedWorkspaceId || !selectedSessionId) {
+      return { outputs: [], outputCount: 0 };
+    }
+    const transcript = this.sessionState.transcriptCache.get(sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId })) ?? [];
+    return projectDevelopmentWorkflowOutputs(transcript);
+  }
+
+  private resolveSelectedSessionError(
+    selectedWorkspaceId: string,
+    selectedSessionId: string,
+    clearLastError?: boolean,
+  ): string | undefined {
+    if (!selectedWorkspaceId || !selectedSessionId) {
+      return undefined;
+    }
+
+    const key = sessionKey({ workspaceId: selectedWorkspaceId, sessionId: selectedSessionId });
+    if (clearLastError) {
+      this.sessionState.sessionErrorsBySession.delete(key);
+      return undefined;
+    }
+
+    return this.sessionState.sessionErrorsBySession.get(key);
+  }
+
+  updateSessionConfig(sessionRef: SessionRef, config: SessionConfig | undefined): void {
+    const key = sessionKey(sessionRef);
+    if (config && Object.keys(config).length > 0) {
+      this.sessionState.sessionConfigBySession.set(key, config);
+    } else {
+      this.sessionState.sessionConfigBySession.delete(key);
+    }
+  }
+
+  updateQueuedComposerMessages(sessionRef: SessionRef, queuedMessages: readonly SessionQueuedMessage[] | undefined): void {
+    const key = sessionKey(sessionRef);
+    const next = mergeQueuedComposerMessages(this.sessionState.queuedComposerMessagesBySession.get(key), queuedMessages);
+    if (next.length > 0) {
+      this.sessionState.queuedComposerMessagesBySession.set(key, next);
+    } else {
+      this.sessionState.queuedComposerMessagesBySession.delete(key);
+    }
+
+    const editState = this.sessionState.queuedComposerEditsBySession.get(key);
+    if (editState && !next.some((message) => message.id === editState.messageId)) {
+      this.sessionState.queuedComposerEditsBySession.delete(key);
+    }
+  }
+
+  getQueuedComposerMessages(sessionRef: SessionRef): readonly QueuedComposerMessage[] {
+    return this.sessionState.queuedComposerMessagesBySession.get(sessionKey(sessionRef)) ?? [];
+  }
+
+  setQueuedComposerEditState(sessionRef: SessionRef, editState: QueuedComposerEditState | undefined): void {
+    const key = sessionKey(sessionRef);
+    if (editState) {
+      this.sessionState.queuedComposerEditsBySession.set(key, editState);
+    } else {
+      this.sessionState.queuedComposerEditsBySession.delete(key);
+    }
+  }
+
+  getQueuedComposerEditState(sessionRef: SessionRef): QueuedComposerEditState | undefined {
+    return this.sessionState.queuedComposerEditsBySession.get(sessionKey(sessionRef));
+  }
+
+  private syncSelectedSessionHydrationState(
+    state: DesktopAppState,
+    sessionRef: SessionRef,
+    snapshot?: SessionSnapshot,
+    runtimeByWorkspace?: Record<string, RuntimeSnapshot>,
+  ): DesktopAppState {
+    const key = sessionKey(sessionRef);
+    const transcript = (this.sessionState.transcriptCache.get(key) ?? []).map(cloneTranscriptMessage);
+    const preview = previewFromTranscript(transcript);
+    const lastViewedAt = this.sessionState.lastViewedAtBySession.get(key);
+    const nextState = {
+      ...state,
+      ...(runtimeByWorkspace ? { runtimeByWorkspace } : {}),
+      workspaces: state.workspaces.map((workspace) =>
+        workspace.id === sessionRef.workspaceId
+          ? {
+              ...workspace,
+              sessions: workspace.sessions.map((session) => {
+                if (session.id !== sessionRef.sessionId) {
+                  return session;
+                }
+
+                return updateSessionRecord(session, {
+                  snapshot:
+                    snapshot || this.sessionState.sessionConfigBySession.has(key)
+                      ? {
+                          ...snapshot,
+                          config: this.sessionState.sessionConfigBySession.get(key) ?? snapshot?.config,
+                        }
+                      : undefined,
+                  transcript,
+                  preview,
+                  runningSince: this.sessionState.runningSinceBySession.get(key),
+                  lastViewedAt,
+                });
+              }),
+            }
+          : workspace,
+      ),
+      composerAttachments: this.resolveComposerAttachments(state.selectedWorkspaceId, state.selectedSessionId),
+      lastError: undefined,
+      revision: state.revision + 1,
+    };
+
+    return this.syncDerivedSessionState(nextState, sessionRef);
+  }
+  setPendingAutoTitle(sessionRef: SessionRef, pending: import("./session-state-map").PendingAutoTitle): void {
+    this.clearPendingAutoTitle(sessionRef);
+    this.sessionState.pendingAutoTitleBySession.set(sessionKey(sessionRef), pending);
+  }
+
+  getPendingAutoTitle(sessionRef: SessionRef): import("./session-state-map").PendingAutoTitle | undefined {
+    return this.sessionState.pendingAutoTitleBySession.get(sessionKey(sessionRef));
+  }
+
+  clearPendingAutoTitle(sessionRef: SessionRef): void {
+    const key = sessionKey(sessionRef);
+    const pendingAutoTitle = this.sessionState.pendingAutoTitleBySession.get(key);
+    if (!pendingAutoTitle) {
+      return;
+    }
+    this.sessionState.pendingAutoTitleBySession.delete(key);
+    pendingAutoTitle.cancel();
+  }
+}
+
+/* ── Module-private free functions ───────────────────────── */
+
+function normalizeSessionCategoryNodes(
+  nodes: readonly SessionCategoryNode[],
+  depth: number,
+): readonly SessionCategoryNode[] {
+  if (depth > 3) {
+    return [];
+  }
+
+  const seenNodeIds = new Set<string>();
+  return nodes.flatMap((node): SessionCategoryNode[] => {
+    const id = node.id.trim();
+    const name = node.name.trim();
+    if (!id || !name || seenNodeIds.has(id)) {
+      return [];
+    }
+    seenNodeIds.add(id);
+
+    const seenSessionRefs = new Set<string>();
+    const sessionRefs = node.sessionRefs.flatMap((ref) => {
+      const workspaceId = ref.workspaceId.trim();
+      const sessionId = ref.sessionId.trim();
+      const key = `${workspaceId}:${sessionId}`;
+      if (!workspaceId || !sessionId || seenSessionRefs.has(key)) {
+        return [];
+      }
+      seenSessionRefs.add(key);
+      return [{ workspaceId, sessionId }];
+    });
+
+    return [{
+      id,
+      name,
+      sessionRefs,
+      children: normalizeSessionCategoryNodes(node.children, depth + 1),
+    }];
+  });
+}
+
+function updateRecordValue<T>(
+  record: Readonly<Record<string, T>>,
+  key: string,
+  value: T | undefined,
+): Readonly<Record<string, T>> {
+  if (value === undefined) {
+    if (!(key in record)) {
+      return record;
+    }
+
+    const { [key]: _removed, ...rest } = record;
+    return rest;
+  }
+
+  if (record[key] === value) {
+    return record;
+  }
+
+  return {
+    ...record,
+    [key]: value,
+  };
+}
+
+function applyModelSettingsSnapshot(
+  runtime: RuntimeSnapshot,
+  settings: ModelSettingsSnapshot,
+): RuntimeSnapshot {
+  return {
+    ...runtime,
+    settings: {
+      ...runtime.settings,
+      ...(settings.defaultProvider ? { defaultProvider: settings.defaultProvider } : { defaultProvider: undefined }),
+      ...(settings.defaultModelId ? { defaultModelId: settings.defaultModelId } : { defaultModelId: undefined }),
+      ...(settings.defaultThinkingLevel
+        ? { defaultThinkingLevel: settings.defaultThinkingLevel }
+        : { defaultThinkingLevel: undefined }),
+      enabledModelPatterns: [...settings.enabledModelPatterns],
+    },
+  };
+}
+
+async function readProjectModelSettingsFile(workspacePath: string): Promise<Record<string, unknown>> {
+  try {
+    const raw = await readFile(join(workspacePath, ".pi", "settings.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+async function updateProjectModelSettingsFile(
+  workspacePath: string,
+  updater: (settings: Record<string, unknown>) => Record<string, unknown>,
+): Promise<void> {
+  const current = await readProjectModelSettingsFile(workspacePath);
+  const next = updater({ ...current });
+  const configDir = join(workspacePath, ".pi");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(join(configDir, "settings.json"), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+}
+
+function mergeModelSettingsSnapshot(
+  globalSettings: ModelSettingsSnapshot,
+  projectSettings: Record<string, unknown>,
+): ModelSettingsSnapshot {
+  const defaultProvider =
+    typeof projectSettings.defaultProvider === "string"
+      ? projectSettings.defaultProvider
+      : globalSettings.defaultProvider;
+  const defaultModelId =
+    typeof projectSettings.defaultModel === "string"
+      ? projectSettings.defaultModel
+      : globalSettings.defaultModelId;
+  const defaultThinkingLevel =
+    typeof projectSettings.defaultThinkingLevel === "string"
+      ? (projectSettings.defaultThinkingLevel as RuntimeSettingsSnapshot["defaultThinkingLevel"])
+      : globalSettings.defaultThinkingLevel;
+
+  return {
+    enabledModelPatterns: Array.isArray(projectSettings.enabledModels)
+      ? projectSettings.enabledModels.filter((value): value is string => typeof value === "string")
+      : [...globalSettings.enabledModelPatterns],
+    ...(defaultProvider ? { defaultProvider } : {}),
+    ...(defaultModelId ? { defaultModelId } : {}),
+    ...(defaultThinkingLevel ? { defaultThinkingLevel } : {}),
+  };
+}
+
+function hasStoredModelSettings(settings: ModelSettingsSnapshot | undefined): settings is ModelSettingsSnapshot {
+  return Boolean(
+    settings &&
+      (settings.enabledModelPatterns.length > 0 ||
+        settings.defaultProvider ||
+        settings.defaultModelId ||
+        settings.defaultThinkingLevel),
+  );
+}
+
+function modelSettingsEqual(left: ModelSettingsSnapshot, right: ModelSettingsSnapshot): boolean {
+  return (
+    left.defaultProvider === right.defaultProvider &&
+    left.defaultModelId === right.defaultModelId &&
+    left.defaultThinkingLevel === right.defaultThinkingLevel &&
+    left.enabledModelPatterns.length === right.enabledModelPatterns.length &&
+    left.enabledModelPatterns.every((pattern, index) => pattern === right.enabledModelPatterns[index])
+  );
+}
+
+function mergeEnabledModelPatterns(
+  existingPatterns: readonly string[],
+  providerPatterns: readonly string[],
+): readonly string[] {
+  const merged = [...existingPatterns];
+  const seen = new Set(existingPatterns);
+  for (const pattern of providerPatterns) {
+    if (seen.has(pattern)) {
+      continue;
+    }
+    seen.add(pattern);
+    merged.push(pattern);
+  }
+  return merged;
+}
+
+async function loadDockComponentDefinitions(agentDir: string): Promise<readonly DockComponentDefinition[]> {
+  const componentsDir = join(agentDir, "components");
+  let entries: readonly { readonly name: string; isDirectory(): boolean }[];
+  try {
+    entries = await readdir(componentsDir, { withFileTypes: true, encoding: "utf8" });
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return [];
+    }
+    throw error;
+  }
+
+  const definitions = await Promise.all(entries
+    .filter((entry) => entry.isDirectory())
+    .map(async (entry) => {
+      const componentPath = join(componentsDir, entry.name, "component.json");
+      try {
+        const raw = await readFile(componentPath, "utf8");
+        const parsed = JSON.parse(raw) as DockComponentDefinition;
+        return normalizeDockComponentDefinition(parsed, componentPath);
+      } catch (error) {
+        console.warn(`[pi-gui] Failed to load component ${componentPath}: ${error instanceof Error ? error.message : String(error)}`);
+        return undefined;
+      }
+    }));
+  return definitions.filter((definition): definition is DockComponentDefinition => Boolean(definition));
+}
+
+async function writeDockComponentDefinition(agentDir: string, definition: DockComponentDefinition): Promise<void> {
+  const safeId = definition.id.trim().replace(/[^a-zA-Z0-9._-]/g, "-") || `component-${Date.now().toString(36)}`;
+  const componentsDir = join(agentDir, "components", safeId);
+  await mkdir(componentsDir, { recursive: true });
+  const normalized = normalizeDockComponentDefinition({ ...definition, id: safeId }, join(componentsDir, "component.json"));
+  await writeFile(join(componentsDir, "component.json"), `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
+}
+
+function normalizeDockComponentDefinition(
+  definition: DockComponentDefinition,
+  componentPath: string,
+): DockComponentDefinition {
+  return sanitizeDockComponentDefinitionForState({
+    id: definition.id,
+    label: definition.label || definition.id,
+    icon: definition.icon || "🧩",
+    kind: definition.kind || "custom",
+    source: definition.source || "user",
+    description: definition.description || "可插拔组件。",
+    ...(definition.extensionPath ? { extensionPath: definition.extensionPath } : {}),
+    componentPath,
+    ...(definition.developmentMode ? { developmentMode: definition.developmentMode } : {}),
+    ...(definition.configJson ? { configJson: definition.configJson } : {}),
+  });
+}
+
+async function discoverThirdPartyModels(input: ThirdPartyModelDiscoveryInput): Promise<readonly ThirdPartyDiscoveredModel[]> {
+  const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
+  if (!baseUrl) {
+    throw new Error("Base URL is required.");
+  }
+  if (!input.apiKey.trim()) {
+    throw new Error("API Key is required.");
+  }
+  const response = await fetch(`${baseUrl}/models`, {
+    method: "GET",
+    headers: modelDiscoveryHeaders(input),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(`获取模型列表失败：${response.status} ${response.statusText}${body ? ` - ${body.slice(0, 200)}` : ""}`);
+  }
+  const payload = await response.json() as unknown;
+  return parseDiscoveredModels(payload);
+}
+
+function modelDiscoveryHeaders(input: ThirdPartyModelDiscoveryInput): Record<string, string> {
+  const apiKey = input.apiKey.trim();
+  switch (input.apiType) {
+    case "anthropic-messages":
+      return {
+        "accept": "application/json",
+        "anthropic-version": "2023-06-01",
+        "x-api-key": apiKey,
+      };
+    case "google-generative-ai":
+      return {
+        "accept": "application/json",
+        "x-goog-api-key": apiKey,
+        "authorization": `Bearer ${apiKey}`,
+      };
+    case "openai-completions":
+    case "openai-responses":
+    default:
+      return {
+        "accept": "application/json",
+        "authorization": `Bearer ${apiKey}`,
+      };
+  }
+}
+
+function parseDiscoveredModels(payload: unknown): readonly ThirdPartyDiscoveredModel[] {
+  const records = Array.isArray(payload)
+    ? payload
+    : typeof payload === "object" && payload !== null && Array.isArray((payload as { data?: unknown }).data)
+      ? (payload as { data: unknown[] }).data
+      : typeof payload === "object" && payload !== null && Array.isArray((payload as { models?: unknown }).models)
+        ? (payload as { models: unknown[] }).models
+        : [];
+
+  const seen = new Set<string>();
+  const models: ThirdPartyDiscoveredModel[] = [];
+  for (const record of records) {
+    if (typeof record !== "object" || record === null) {
+      continue;
+    }
+    const candidate = record as Record<string, unknown>;
+    const rawId = firstString(candidate.id, candidate.name, candidate.model, candidate.display_name);
+    if (!rawId) {
+      continue;
+    }
+    const id = rawId.replace(/^models\//, "");
+    if (seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    models.push({
+      id,
+      name: firstString(candidate.display_name, candidate.displayName, candidate.label, candidate.name) ?? id,
+    });
+  }
+  return models;
+}
+
+function firstString(...values: readonly unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return undefined;
+}
+
+async function upsertThirdPartyModelProvider(agentDir: string, input: ThirdPartyModelProviderInput): Promise<void> {
+  const providerId = input.providerId.trim();
+  const providerName = input.providerName.trim() || providerId;
+  const baseUrl = input.baseUrl.trim().replace(/\/+$/, "");
+  const apiKey = input.apiKey.trim();
+  if (!providerId) {
+    throw new Error("Provider ID is required.");
+  }
+  if (!baseUrl) {
+    throw new Error("Base URL is required.");
+  }
+  if (!apiKey) {
+    throw new Error("API Key is required.");
+  }
+  if (input.selectedModels.length === 0) {
+    throw new Error("Select at least one model.");
+  }
+
+  await mkdir(agentDir, { recursive: true });
+  const modelsJsonPath = join(agentDir, "models.json");
+  const existing = await readModelsJson(modelsJsonPath);
+  const providers = { ...(existing.providers ?? {}) };
+  providers[providerId] = {
+    ...(providers[providerId] && typeof providers[providerId] === "object" ? providers[providerId] : {}),
+    name: providerName,
+    baseUrl,
+    api: input.apiType,
+    apiKey,
+    models: input.selectedModels.map((model) => ({
+      id: model.id,
+      name: model.name || model.id,
+    })),
+  };
+  await writeFile(modelsJsonPath, `${JSON.stringify({ ...existing, providers }, null, 2)}\n`, "utf8");
+}
+
+async function readModelsJson(modelsJsonPath: string): Promise<{ providers?: Record<string, Record<string, unknown>> }> {
+  try {
+    const raw = await readFile(modelsJsonPath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed === "object" && parsed !== null) {
+      return parsed as { providers?: Record<string, Record<string, unknown>> };
+    }
+    return {};
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
+      return {};
+    }
+    throw error;
+  }
+}
+
+function formatCapabilityLabel(capability: string): string {
+  switch (capability) {
+    case "custom":
+      return "custom UI";
+    case "onTerminalInput":
+      return "terminal input";
+    case "setEditorComponent":
+      return "custom editor UI";
+    case "setFooter":
+      return "footer UI";
+    case "setHeader":
+      return "header UI";
+    default:
+      return capability.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  }
+}
+
+function normalizeConversationGroupName(name: string): string {
+  const normalized = name.trim().replace(/\s+/g, " ");
+  if (!normalized) {
+    throw new Error("请输入对话分组名称");
+  }
+  if (normalized.length > 80) {
+    throw new Error("对话分组名称不能超过 80 个字符");
+  }
+  return normalized;
+}
+
+function resolvePersistedAppearanceTheme(
+  persistedTheme: AppearanceThemeId | undefined,
+  defaultTheme: AppearanceThemeId,
+  availableThemes: readonly AppearanceThemeRecord[],
+): AppearanceThemeId {
+  if (!persistedTheme) {
+    return defaultTheme;
+  }
+  if (availableThemes.some((theme) => theme.id === persistedTheme)) {
+    return persistedTheme;
+  }
+  return availableThemes.find((theme) => theme.id === "pi-native")?.id
+    ?? availableThemes[0]?.id
+    ?? "pi-native";
+}
+
+function resolveSelectedWorkspaceIdFromCatalog(
+  preferredWorkspaceId: string,
+  workspaces: readonly { workspaceId: string }[],
+): string {
+  if (preferredWorkspaceId && workspaces.some((w) => w.workspaceId === preferredWorkspaceId)) {
+    return preferredWorkspaceId;
+  }
+  return workspaces[0]?.workspaceId ?? "";
+}
+
+function hasEquivalentLoadedMessage(
+  loadedTranscript: readonly TranscriptMessage[],
+  candidate: TranscriptMessage,
+): boolean {
+  if (candidate.kind !== "message") {
+    return loadedTranscript.some((entry) => entry.id === candidate.id);
+  }
+
+  return loadedTranscript.some((entry) => {
+    if (entry.id === candidate.id) return true;
+    if (entry.kind !== "message") return false;
+    return entry.role === candidate.role &&
+      entry.text === candidate.text &&
+      entry.createdAt === candidate.createdAt;
+  });
+}
+
+function resolveSelectedSessionIdFromCatalog(
+  workspaceId: string,
+  preferredSessionId: string,
+  sessions: readonly SessionCatalogEntry[],
+): string {
+  const workspaceSessions = sessions.filter((session) => session.workspaceId === workspaceId);
+  if (!workspaceSessions.length) {
+    return "";
+  }
+  if (
+    preferredSessionId &&
+    workspaceSessions.some((session) => session.sessionRef.sessionId === preferredSessionId)
+  ) {
+    return preferredSessionId;
+  }
+  return workspaceSessions[0]?.sessionRef.sessionId ?? "";
+}

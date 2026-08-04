@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "rootDir": ".",
+    "outDir": "dist-tests",
+    "types": ["node"]
+  },
+  "include": [
+    "src/services/pairing.ts",
+    "src/services/conversation-groups.ts",
+    "src/services/diagnostics.ts",
+    "tests/**/*.test.ts"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "id": "development-mode-mr1t0j8s",
+  "label": "123",
+  "icon": "🤖",
+  "kind": "development-mode",
+  "source": "user",
+  "description": "用户配置的 Dock 组件。",
+  "componentPath": "S:\\tool\\pi\\agent\\components\\development-mode-mr1t0j8s\\component.json",
+  "developmentMode": {
+    "mainAgent": {
+      "provider": "",
+      "modelId": "",
+      "thinkingLevel": "medium"
+    },
+    "subagents": []
+  },
+  "configJson": "{}"
+}

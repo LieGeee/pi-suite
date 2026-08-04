@@ -1,0 +1,185 @@
+/* ── Appearance Themes ──────────────────────────────────
+ * Three themes sharing the same layout skeleton.
+ * :root[data-appearance-theme=…] scoping avoids conflicts
+ * with built-in .dark / .enable-transparency modifiers.
+ *
+ * The miku-dream theme also accepts --appearance-hero-image
+ * set dynamically by App.tsx from AppearanceThemeRecord.heroImageUrl.
+ * ───────────────────────────────────────────────────── */
+
+/* ============ Shared layout (multiplicities OK) ============ */
+[data-appearance-theme] {
+  /* letter-spacing: 0 as the global default for the three themes */
+}
+[data-appearance-theme] body {
+  letter-spacing: 0;
+}
+
+/* =================== Miku Dream =================== */
+[data-appearance-theme="miku-dream"] {
+  --miku-accent: #14b8a6;          /* teal-500 */
+  --miku-accent-soft: #5eead4;     /* teal-300 */
+  --miku-accent-muted: #ccfbf1;    /* teal-100 */
+  --miku-purple-light: #c4b5fd;    /* violet-300 */
+  --miku-purple-muted: #ede9fe;    /* violet-100 */
+  --miku-surface: rgba(255, 255, 255, 0.88);
+  --miku-sidebar: rgba(255, 255, 255, 0.82);
+}
+
+[data-appearance-theme="miku-dream"] .shell {
+  background:
+    linear-gradient(
+      135deg,
+      rgba(5, 8, 18, var(--shell-gradient-primary-alpha, 0.72)),
+      rgba(7, 10, 24, var(--shell-gradient-secondary-alpha, 0.66))
+    ),
+    var(--appearance-hero-image, url("../assets/miku-hero.jpg")) center / cover no-repeat;
+}
+
+[data-appearance-theme="miku-dream"] .sidebar {
+  background: var(--miku-sidebar);
+  border-right-color: rgba(221, 225, 234, 0.5);
+  backdrop-filter: none;
+}
+
+[data-appearance-theme="miku-dream"] .sidebar__brand-mark {
+  color: var(--miku-accent);
+  text-shadow: 0 0 12px rgba(20, 184, 166, 0.4);
+}
+
+[data-appearance-theme="miku-dream"] .sidebar__tab--active {
+  color: var(--miku-accent);
+  border-bottom-color: var(--miku-accent);
+}
+
+[data-appearance-theme="miku-dream"] .new-thread__eyebrow-miku {
+  display: inline;
+  color: var(--miku-accent);
+}
+
+[data-appearance-theme="miku-dream"] .new-thread__eyebrow-default {
+  display: none;
+  color: var(--muted-soft);
+}
+
+[data-appearance-theme="miku-dream"] .new-thread__quick-actions button:hover {
+  border-color: var(--miku-accent-soft);
+  background: rgba(20, 184, 166, 0.06);
+}
+
+[data-appearance-theme="miku-dream"] .new-thread__quick-icon {
+  color: var(--miku-accent);
+}
+
+[data-appearance-theme="miku-dream"] .conversation-row__assign {
+  color: var(--miku-accent);
+}
+
+[data-appearance-theme="miku-dream"] .main {
+  background: rgba(248, 248, 251, var(--main-panel-alpha, 0.64));
+}
+
+/* =================== Pure White =================== */
+[data-appearance-theme="pure-white"] {
+  --pw-bg: #ffffff;
+  --pw-sidebar: #fafafa;
+  --pw-main: #ffffff;
+  --pw-surface: #ffffff;
+  --pw-surface-muted: #f5f5f5;
+  --pw-line: #e5e5e5;
+  --pw-line-strong: #d4d4d4;
+  --pw-text: #262626;
+  --pw-text-strong: #171717;
+  --pw-muted: #a3a3a3;
+  --pw-muted-strong: #737373;
+  --pw-accent: #525252;
+}
+
+[data-appearance-theme="pure-white"] .shell {
+  background: var(--pw-bg);
+}
+
+[data-appearance-theme="pure-white"] .sidebar {
+  background: var(--pw-sidebar);
+  border-right-color: var(--pw-line);
+  backdrop-filter: none;
+}
+
+[data-appearance-theme="pure-white"] .main {
+  background: var(--pw-main);
+}
+
+[data-appearance-theme="pure-white"] .topbar {
+  background: var(--pw-surface);
+  border-bottom-color: var(--pw-line);
+}
+
+[data-appearance-theme="pure-white"] .composer {
+  background: transparent;
+}
+
+[data-appearance-theme="pure-white"] .composer__surface {
+  border-color: var(--pw-line);
+  background: var(--pw-surface);
+}
+
+[data-appearance-theme="pure-white"] .new-thread__workspace,
+[data-appearance-theme="pure-white"] .new-thread__environment {
+  border-color: var(--pw-line);
+  background: var(--pw-surface-muted);
+  color: var(--pw-text-strong);
+}
+
+[data-appearance-theme="pure-white"] .new-thread__environment--active {
+  background: var(--pw-surface-muted);
+  border-color: var(--pw-line-strong);
+}
+
+[data-appearance-theme="pure-white"] .sidebar__nav-item--active {
+  background: var(--pw-surface);
+  border-color: var(--pw-line);
+}
+
+[data-appearance-theme="pure-white"] .sidebar__new {
+  background: var(--pw-surface-muted);
+  border-color: var(--pw-line);
+}
+
+[data-appearance-theme="pure-white"] .session-row--active {
+  background: var(--pw-surface);
+  border-color: var(--pw-line);
+}
+
+[data-appearance-theme="pure-white"] .workspace-row__name {
+  color: var(--pw-muted-strong);
+}
+
+[data-appearance-theme="pure-white"] .new-thread__eyebrow-miku,
+[data-appearance-theme="pure-white"] .new-thread__eyebrow-default {
+  color: var(--pw-muted);
+}
+
+[data-appearance-theme="pure-white"] .new-thread__title {
+  color: var(--pw-text-strong);
+}
+
+/* =================== Pi Native =================== */
+/* Uses the existing CSS custom properties defined in base.css.
+   Only override things that need resetting for the theme system. */
+[data-appearance-theme="pi-native"] .sidebar {
+  background: var(--sidebar);
+  border-right-color: var(--line);
+  backdrop-filter: none;
+}
+
+[data-appearance-theme="pi-native"] .new-thread__eyebrow-miku {
+  color: var(--muted);
+}
+
+[data-appearance-theme="pi-native"] .new-thread__eyebrow-default {
+  color: var(--muted);
+}
+
+[data-appearance-theme="pi-native"] .sidebar__brand-mark {
+  color: var(--accent);
+}

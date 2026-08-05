@@ -49,16 +49,21 @@ jobs:
             --publish never \
             "-c.extraMetadata.version=${VERSION}"
 
-      - name: Upload installer to release
+      - name: Create/ensure release then upload installer
         shell: bash
         working-directory: pi-gui/apps/desktop
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release upload "${GITHUB_REF_NAME}" \
-            "release/pi-gui-${VERSION}-x64.exe" \
-            --clobber
+          TAG="${GITHUB_REF_NAME}"
+          ARTIFACT="release/pi-gui-${VERSION}-x64.exe"
+          # Create the release if it does not exist yet (idempotent)
+          gh release create "${TAG}" --title "pi-suite ${TAG}" \
+            --notes "pi-suite ${TAG} release" \
+            --latest || true
+          gh release upload "${TAG}" "${ARTIFACT}" --clobber
 
       - name: Generate SLSA subject (SHA256 digest)
         shell: bash

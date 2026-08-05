@@ -16,6 +16,15 @@ pi-gui desktop <--WebSocket--> pi-mobile-relay <--WebSocket/HTTPS--> pi-mobile-u
 
 手机端通过 relay 与桌面端配对，**不存储模型密钥或 Pi 认证文件**，所有操作经配对 Token 授权后转发到桌面端执行。
 
+
+## 监控(pi-monitor)
+
+- **监控 tab**: 管理股票/新闻/商品监控项(新增/编辑/删除/启停)
+- **推送设置**: 抓取间隔、Server酱/Webhook、告警开关
+- 默认 API 地址 `http://47.121.197.240:18080`, 可在监控页顶部齿轮修改
+
+> 通过 `src/services/monitor.ts` 对接, 与 relay 配对互不影响。
+
 ## 开发
 
 ```bash

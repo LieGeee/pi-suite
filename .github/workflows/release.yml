@@ -12,6 +12,8 @@ jobs:
   desktop-win:
     name: Build Windows installer
     runs-on: windows-latest
+    outputs:
+      digests: ${{ steps.hash.outputs.digests }}
 
     steps:
       - uses: actions/checkout@v4
@@ -55,3 +57,25 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" \
             "release/pi-gui-${VERSION}-x64.exe" \
             --clobber
+
+      - name: Generate SLSA subject (SHA256 digest)
+        shell: bash
+        working-directory: pi-gui/apps/desktop
+        id: hash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARTIFACT="release/pi-gui-${VERSION}-x64.exe"
+          echo "digests=$(sha256sum "${ARTIFACT}" | base64 -w0)" >> "${GITHUB_OUTPUT}"
+
+  slsa-provenance:
+    name: Generate SLSA3 provenance
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    needs: [desktop-win]
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.desktop-win.outputs.digests }}"
+      upload-assets: true

@@ -37,9 +37,9 @@ const testResult = ref('')
 const testOk = ref(false)
 
 const typeOptions: { key: 'stock' | 'news' | 'product'; label: string; hint: string; placeholder: string }[] = [
-  { key: 'stock', label: '股票行情', hint: '监控 A 股行情，支持涨跌幅/价格阈值告警', placeholder: '如 sh600519 / sz000001 / bj830799' },
+  { key: 'stock', label: '股票行情', hint: '支持 A股/港股/美股/指数行情，可设涨跌幅与价格阈值告警', placeholder: 'sh600519 / hk00700 / usAAPL / sh000001' },
   { key: 'news', label: '新闻关键词', hint: '按关键词监控多个新闻源，命中即收录并推送', placeholder: '如 人工智能,AI,大模型(逗号分隔)' },
-  { key: 'product', label: '商品价格', hint: '监控淘宝/京东/闲鱼等商品链接的价格变化', placeholder: '粘贴商品链接 URL' },
+  { key: 'product', label: '商品价格', hint: '监控商品价格 API / 官网 JSON-LD / 自定正则', placeholder: '价格 API 或商品页 URL' },
 ]
 
 onLoad((query) => {

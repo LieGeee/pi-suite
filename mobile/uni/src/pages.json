@@ -28,6 +28,27 @@
         "backgroundColor": "#f5f6f8",
         "disableScroll": true
       }
+    },
+    {
+      "path": "pages/monitor/index",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
+    },
+    {
+      "path": "pages/monitor/edit",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
+    },
+    {
+      "path": "pages/monitor/settings",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
     }
   ],
   "globalStyle": {
@@ -59,6 +80,12 @@
         "text": "通知",
         "iconPath": "static/tab-tasks.png",
         "selectedIconPath": "static/tab-tasks-active.png"
+      },
+      {
+        "pagePath": "pages/monitor/index",
+        "text": "监控",
+        "iconPath": "static/tab-monitor.png",
+        "selectedIconPath": "static/tab-monitor-active.png"
       },
       {
         "pagePath": "pages/settings/index",

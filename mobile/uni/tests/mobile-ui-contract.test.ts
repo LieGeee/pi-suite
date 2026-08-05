@@ -107,8 +107,12 @@ test('sync and send actions always give feedback instead of silently doing nothi
 
 test('all mobile pages use one custom header instead of duplicate native titles', () => {
   const pages = source('src/pages.json')
-  const matches = pages.match(/"navigationStyle"\s*:\s*"custom"/g) ?? []
-  assert.equal(matches.length, 4)
+  const pageEntries = (pages.match(/"path"\s*:\s*"pages\/[^"]+"/g) ?? [])
+  const custom = (pages.match(/"navigationStyle"\s*:\s*"custom"/g) ?? [])
+  // 每个注册页面都必须使用 custom 导航(不允许原生标题栏重复)
+  assert.ok(pageEntries.length >= 4, `expected at least 4 pages, got ${pageEntries.length}`)
+  assert.equal(custom.length, pageEntries.length,
+    `every page must use custom navigation (pages=${pageEntries.length}, custom=${custom.length})`)
 })
 
 test('conversation detail shows rich message rendering, copy, and quick replies', () => {

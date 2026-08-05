@@ -159,6 +159,8 @@ function statusText(s: string): string {
 
 function valueText(item: MonitorItem): string {
   if (item.last_status !== 'ok') return item.last_status === 'fail' ? '抓取失败' : '尚未抓取'
+  if (item.type === 'crypto') return item.last_value ? `$${item.last_value.toFixed(2)}` : ''
+  if (item.type === 'fx') return item.last_value ? item.last_value.toFixed(4) : ''
   if (item.type === 'stock') return item.last_value ? `¥${item.last_value.toFixed(2)}` : ''
   if (item.type === 'product') return item.last_value ? `¥${item.last_value.toFixed(2)}` : ''
   return item.last_value ? `${item.last_value} 条` : ''

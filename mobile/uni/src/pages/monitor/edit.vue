@@ -13,7 +13,7 @@ import {
 } from '@/services/monitor'
 
 const editId = ref<number | null>(null)
-const type = ref<'stock' | 'news' | 'product'>('stock')
+const type = ref<'stock' | 'news' | 'product' | 'crypto' | 'fx'>('stock')
 const name = ref('')
 const target = ref('')
 const enabled = ref(true)
@@ -30,16 +30,21 @@ const priceRegex = ref('')
 const titleRegex = ref('')
 // news
 const sources = ref('')
+// crypto/fx
+const alertBelow = ref('')
+const alertAbove = ref('')
 
 const saving = ref(false)
 const testing = ref(false)
 const testResult = ref('')
 const testOk = ref(false)
 
-const typeOptions: { key: 'stock' | 'news' | 'product'; label: string; hint: string; placeholder: string }[] = [
-  { key: 'stock', label: '股票行情', hint: '支持 A股/港股/美股/指数行情，可设涨跌幅与价格阈值告警', placeholder: 'sh600519 / hk00700 / usAAPL / sh000001' },
-  { key: 'news', label: '新闻关键词', hint: '按关键词监控多个新闻源，命中即收录并推送', placeholder: '如 人工智能,AI,大模型(逗号分隔)' },
-  { key: 'product', label: '商品价格', hint: '监控商品价格 API / 官网 JSON-LD / 自定正则', placeholder: '价格 API 或商品页 URL' },
+const typeOptions: { key: 'stock' | 'news' | 'product' | 'crypto' | 'fx'; label: string; hint: string; placeholder: string }[] = [
+  { key: 'stock', label: '股票', hint: '支持 A股/港股/美股/指数，可设涨跌幅与价格阈值告警', placeholder: 'sh600519 / hk00700 / usAAPL / sh000001' },
+  { key: 'news', label: '新闻', hint: '按关键词监控多个新闻源，命中即收录并推送', placeholder: '如 人工智能,AI,大模型(逗号分隔)' },
+  { key: 'product', label: '商品', hint: '监控商品价格 API / 官网 JSON-LD / 自定正则', placeholder: '价格 API 或商品页 URL' },
+  { key: 'crypto', label: '加密币', hint: 'Gate.io 行情，如 BTC/ETH，可设价格阈值告警', placeholder: '如 BTC_USDT / ETH_USDT' },
+  { key: 'fx', label: '汇率', hint: '新浪外汇汇率，可设阈值告警', placeholder: '如 susdcny(美元/人民币) / eurusd' },
 ]
 
 onLoad((query) => {
@@ -75,6 +80,8 @@ function fillForm(it: MonitorItem) {
   priceRegex.value = extra.price_regex || ''
   titleRegex.value = extra.title_regex || ''
   sources.value = extra.sources || ''
+  alertBelow.value = extra.alert_below ? String(extra.alert_below) : ''
+  alertAbove.value = extra.alert_above ? String(extra.alert_above) : ''
 }
 
 function buildExtra(): MonitorExtra {
@@ -100,6 +107,12 @@ function buildExtra(): MonitorExtra {
   }
   if (type.value === 'news' && sources.value.trim()) {
     extra.sources = sources.value.trim()
+  }
+  if (type.value === 'crypto' || type.value === 'fx') {
+    const below = num(alertBelow.value)
+    const above = num(alertAbove.value)
+    if (below > 0) extra.alert_below = below
+    if (above > 0) extra.alert_above = above
   }
   return extra
 }
@@ -270,6 +283,20 @@ function onTestStockExample() {
         <input v-model="titleRegex" class="input" placeholder="默认自动识别" />
       </view>
       <view class="hint">提示: 部分平台(淘宝/闲鱼)需要登录，可能无法直接抓到价格，可先点「测试抓取」验证。</view>
+    </view>
+
+    <!-- 加密货币/汇率阈值 -->
+    <view v-if="type === 'crypto' || type === 'fx'" class="card">
+      <view class="section-title">阈值告警(可选)</view>
+      <view class="field">
+        <view class="label">低于</view>
+        <input v-model="alertBelow" class="input" type="digit" placeholder="如 50000" />
+      </view>
+      <view class="field">
+        <view class="label">高于</view>
+        <input v-model="alertAbove" class="input" type="digit" placeholder="如 70000" />
+      </view>
+      <view class="hint">{{ type === 'crypto' ? '加密货币价格阈值(BTC_USDT 单位 USDT)' : '汇率阈值(如美元兑人民币 6.5-7.0)' }}</view>
     </view>
 
     <!-- 新闻源 -->

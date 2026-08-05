@@ -3,7 +3,7 @@
 
 export interface MonitorItem {
   id: number
-  type: 'stock' | 'news' | 'product'
+  type: 'stock' | 'news' | 'product' | 'crypto' | 'fx'
   name: string
   target: string
   extra: string
@@ -29,6 +29,9 @@ export interface MonitorExtra {
   title_regex?: string
   // 新闻
   sources?: string
+  // 加密货币/汇率
+  alert_below?: number
+  alert_above?: number
 }
 
 export interface MonitorSettings {
@@ -187,7 +190,7 @@ export function parseExtra(raw: string): MonitorExtra {
 }
 
 export function typeLabel(type: MonitorItem['type']): string {
-  return ({ stock: '股票', news: '新闻', product: '商品' } as const)[type] || type
+  return ({ stock: '股票', news: '新闻', product: '商品', crypto: '加密币', fx: '汇率' } as const)[type] || type
 }
 
 export function formatTime(value: string): string {

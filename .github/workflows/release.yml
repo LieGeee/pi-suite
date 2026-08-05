@@ -32,9 +32,9 @@ jobs:
         working-directory: pi-gui
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck desktop
+      - name: Build workspace (generates session-driver/sdk types)
         working-directory: pi-gui
-        run: pnpm --filter @pi-gui/desktop typecheck
+        run: pnpm build
 
       - name: Build desktop
         working-directory: pi-gui/apps/desktop

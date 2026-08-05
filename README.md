@@ -76,11 +76,14 @@ pnpm build:app-android   # Android App 构建
 
 ## 使用文档
 
+- **[安装与下载指南](docs/install.md)**：Release 下载、一键安装脚本、常见问题
 - **[桌面版使用指南](docs/usage.md)**：斜杠命令、键盘快捷键、图片粘贴、手机版配对
 - **[斜杠命令速查](docs/slash-commands.md)**：全部 `/` 命令一览
 - **[手机版客户端](mobile/uni/README.md)**：uni-app 客户端说明
 - **[中继服务](mobile/relay/README.md)**：桌面 ↔ 手机 relay 说明
 - **[Web 客户端](mobile/client/README.md)**：Vite + React 移动端说明
+
+> 🚀 **Release 自动构建**：打 `v*` tag 即触发 GitHub Actions 自动构建 Windows 安装包并上传 Release（见 `.github/workflows/release.yml`）。一键安装：`powershell -File scripts/install.ps1`
 
 ### 常用斜杠命令速览
 

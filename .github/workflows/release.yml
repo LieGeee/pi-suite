@@ -1,0 +1,57 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+jobs:
+  desktop-win:
+    name: Build Windows installer
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: pi-gui/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: pi-gui
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck desktop
+        working-directory: pi-gui
+        run: pnpm --filter @pi-gui/desktop typecheck
+
+      - name: Build desktop
+        working-directory: pi-gui/apps/desktop
+        run: pnpm run build
+
+      - name: Package Windows installer (NSIS)
+        shell: bash
+        working-directory: pi-gui/apps/desktop
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          pnpm exec electron-builder --win nsis \
+            --publish never \
+            "-c.extraMetadata.version=${VERSION}"
+
+      - name: Upload installer to release
+        shell: bash
+        working-directory: pi-gui/apps/desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "${GITHUB_REF_NAME}" \
+            "release/pi-gui-${VERSION}-x64.exe" \
+            --clobber

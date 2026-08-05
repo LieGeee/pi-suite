@@ -74,6 +74,48 @@ pnpm dev:h5        # H5 开发
 pnpm build:app-android   # Android App 构建
 ```
 
+## 使用文档
+
+- **[桌面版使用指南](docs/usage.md)**：斜杠命令、键盘快捷键、图片粘贴、手机版配对
+- **[斜杠命令速查](docs/slash-commands.md)**：全部 `/` 命令一览
+- **[手机版客户端](mobile/uni/README.md)**：uni-app 客户端说明
+- **[中继服务](mobile/relay/README.md)**：桌面 ↔ 手机 relay 说明
+- **[Web 客户端](mobile/client/README.md)**：Vite + React 移动端说明
+
+### 常用斜杠命令速览
+
+输入 `/` 即可在输入框弹出命令菜单。
+
+| 命令 | 作用 |
+|------|------|
+| `/model` | 为当前会话选择模型 |
+| `/thinking` | 设置推理强度（低/中/高/超高） |
+| `/tree` | 浏览会话分支 |
+| `/status` | 显示会话状态 |
+| `/session` | 显示会话详情 |
+| `/name 新标题` | 重命名会话 |
+| `/compact` | 压缩上下文 |
+| `/reload` | 重新加载提示词/技能/资源 |
+| `/login` `/logout` | 提供商登录/退出 |
+| `/settings` | 打开设置 |
+| `/scoped-models` | 选择已启用模型 |
+
+> 技能还会注册 `/skill:xxx` 运行时命令，显示在斜杠菜单的「运行时命令」分区。
+
+### 常用快捷键速览
+
+| 快捷键 (Win) | 快捷键 (macOS) | 作用 |
+|--------------|----------------|------|
+| `Ctrl + ,` | `⌘ + ,` | 设置 |
+| `Ctrl + J` | `⌘ + J` | 终端面板 |
+| `Ctrl + B` | `⌘ + B` | 侧边栏 |
+| `Ctrl + D` | `⌘ + D` | 变更 (Diff) 面板 |
+| `Ctrl + Shift + O` | `⌘ + Shift + O` | 新建对话 |
+| `Ctrl + F` | `⌘ + F` | 时间线搜索 |
+| `Ctrl + V` | `⌘ + V` | 粘贴剪贴板图片到输入框 |
+
+> 🖼️ **粘贴图片**：复制任意图片后，在对话输入框按 `Ctrl+V`（macOS `⌘+V`）直接粘贴为附件，支持 PNG / JPG / GIF / WebP（单图 ≤ 10MB）。
+
 ## 安全说明
 
 提交前请确保：

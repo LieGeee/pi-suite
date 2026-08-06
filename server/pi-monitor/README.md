@@ -47,13 +47,17 @@ POST /api/v1/test                  # 测试抓取(不落库) {type,target,extra}
 ## 部署(已在 YOUR_SERVER 完成)
 
 ```bash
-# 服务端 systemd
+# 自动化部署(一条命令: 交叉编译 -> 上传 -> 重启 -> 健康检查)
+DEPLOY_HOST=你的服务器IP ./scripts/deploy-monitor.sh "版本说明"
+
+# 或手动:
 scp bin/pi-monitor-linux root@YOUR_SERVER:/opt/pi-monitor/pi-monitor
 ssh root@YOUR_SERVER
 systemctl enable --now pi-monitor   # 开机自启 + 自动重启
 curl http://127.0.0.1:18080/healthz
 ```
 
+- 自动化部署脚本在仓库根 `scripts/deploy-monitor.sh`, 服务器地址用 `DEPLOY_HOST` 环境变量注入(不硬编码)
 - 数据存 `/opt/pi-monitor/data/monitor.db`(SQLite, 纯 Go 无 CGO)
 - 日志 `journalctl -u pi-monitor -f`
 

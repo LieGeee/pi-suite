@@ -1,5 +1,53 @@
 // pi-monitor 手机端服务层: API 封装 + 本地配置存储。
-// 通过 HTTP 访问部署在服务器上的 pi-monitor 服务(默认 http://47.121.197.240:18080)。
+// 通过 HTTP 访问部署在服务器上的 pi-monitor 服务(默认地址在构建时注入)。
+
+const STORAGE_BASE_URL = 'pi_monitor_base_url'
+const STORAGE_TOKEN = 'pi_monitor_token'
+const STORAGE_USER = 'pi_monitor_user'
+
+export interface MonitorUser {
+  id: number
+  username: string
+  nickname: string
+  created_at: string
+}
+
+// ---- 登录态 -------
+
+export function getToken(): string {
+  try {
+    return uni.getStorageSync(STORAGE_TOKEN) || ''
+  } catch {
+    return ''
+  }
+}
+
+export function setToken(token: string): void {
+  uni.setStorageSync(STORAGE_TOKEN, token)
+}
+
+export function getUser(): MonitorUser | null {
+  try {
+    const s = uni.getStorageSync(STORAGE_USER)
+    return s || null
+  } catch {
+    return null
+  }
+}
+
+export function setUser(u: MonitorUser): void {
+  uni.setStorageSync(STORAGE_USER, u)
+}
+
+export function clearAuth(): void {
+  uni.removeStorageSync(STORAGE_TOKEN)
+  uni.removeStorageSync(STORAGE_USER)
+}
+
+export function isLoggedIn(): boolean {
+  return !!getToken()
+}
+
 
 export interface MonitorItem {
   id: number
@@ -39,6 +87,10 @@ export interface MonitorSettings {
   webhook_url: string
   serverchan_key: string
   notify_enabled: boolean
+  ai_filter_url?: string
+  ai_filter_key?: string
+  ai_filter_model?: string
+  ai_filter_prompt?: string
 }
 
 export interface PricePoint {
@@ -72,10 +124,10 @@ export interface AlertItem {
 
 // ---- 本地配置存储 ----
 
-const STORAGE_BASE_URL = 'pi_monitor_base_url'
-
 export function defaultBaseUrl(): string {
-  return 'http://47.121.197.240:18080'
+  // 构建时注入: vite 通过 import.meta.env.VITE_MONITOR_BASE 覆盖
+  const fromEnv = (import.meta as any).env?.VITE_MONITOR_BASE
+  return fromEnv || 'http://127.0.0.1:18080'
 }
 
 export function getBaseUrl(): string {
@@ -101,19 +153,27 @@ export class ApiError extends Error {
   }
 }
 
-function request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: object): Promise<T> {
+function request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: object, auth = true): Promise<T> {
   const base = getBaseUrl()
   return new Promise<T>((resolve, reject) => {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (auth) {
+      const token = getToken()
+      if (token) headers.Authorization = `Bearer ${token}`
+    }
     uni.request({
       url: base + path,
       method,
       data: body,
       timeout: 20000,
-      header: { 'Content-Type': 'application/json' },
+      header: headers,
       success: (res) => {
         const status = res.statusCode || 0
         if (status >= 200 && status < 300) {
           resolve(res.data as T)
+        } else if (status === 401) {
+          clearAuth()
+          reject(new ApiError(status, '登录已过期，请重新登录'))
         } else {
           const data = res.data as { error?: string } | undefined
           reject(new ApiError(status, data?.error || `请求失败 (${status})`))
@@ -124,6 +184,26 @@ function request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, bod
       },
     })
   })
+}
+
+// ---- 账号 -------
+
+export interface AuthResult {
+  ok: boolean
+  token: string
+  user: MonitorUser
+}
+
+export function register(username: string, password: string, nickname = ''): Promise<AuthResult> {
+  return request('POST', '/api/v1/auth/register', { username, password, nickname }, false)
+}
+
+export function login(username: string, password: string): Promise<AuthResult> {
+  return request('POST', '/api/v1/auth/login', { username, password }, false)
+}
+
+export function logout(): Promise<{ ok: boolean }> {
+  return request('POST', '/api/v1/auth/logout', {})
 }
 
 // ---- 监控项 ----

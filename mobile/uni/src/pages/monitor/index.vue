@@ -5,6 +5,7 @@ import {
   deleteItem,
   formatTime,
   getBaseUrl,
+  isLoggedIn,
   listAlerts,
   listItems,
   listNews,
@@ -27,6 +28,29 @@ const loading = ref(false)
 const refreshing = ref(false)
 const showServer = ref(false)
 const serverUrl = ref(getBaseUrl())
+const touchStartX = ref(0)
+const touchStartY = ref(0)
+
+// 左右滑动切换 tab
+function onTouchStart(e: TouchEvent) {
+  touchStartX.value = e.touches[0].clientX
+  touchStartY.value = e.touches[0].clientY
+}
+
+function onTouchEnd(e: TouchEvent) {
+  const dx = e.changedTouches[0].clientX - touchStartX.value
+  const dy = e.changedTouches[0].clientY - touchStartY.value
+  // 水平滑动 > 60px 且比垂直位移大, 才切换
+  if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+    const order: TabKey[] = ['items', 'news', 'alerts']
+    const idx = order.indexOf(activeTab.value)
+    if (dx < 0 && idx < order.length - 1) {
+      activeTab.value = order[idx + 1]
+    } else if (dx > 0 && idx > 0) {
+      activeTab.value = order[idx - 1]
+    }
+  }
+}
 
 const statusTitle = computed(() => {
   const ok = items.value.filter((i) => i.last_status === 'ok').length
@@ -39,6 +63,11 @@ const filteredAlerts = computed(() => alerts.value.slice(0, 30))
 
 onShow(() => {
   serverUrl.value = getBaseUrl()
+  // 未登录则跳登录页
+  if (!isLoggedIn()) {
+    uni.reLaunch({ url: '/pages/monitor/login' })
+    return
+  }
   load()
 })
 
@@ -169,10 +198,35 @@ function valueText(item: MonitorItem): string {
 function tabTitle(t: TabKey): string {
   return ({ items: '监控项', news: '新闻', alerts: '告警' } as const)[t]
 }
+
+// 告警详情(展开显示完整信息)
+const expandedAlert = ref<AlertItem | null>(null)
+
+function toggleAlert(a: AlertItem) {
+  expandedAlert.value = expandedAlert.value?.id === a.id ? null : a
+}
+
+function alertTypeLabel(t: string): string {
+  return ({
+    news_hit: '新闻命中',
+    threshold: '阈值告警',
+    price_low: '低价提醒',
+    price_high: '高价提醒',
+    product_change: '价格变动',
+    check_fail: '抓取失败',
+  } as const)[t as keyof typeof alertTypeLabel] || t
+}
+
+function onCopyAlertText(a: AlertItem) {
+  uni.setClipboardData({
+    data: `${a.message}\n时间: ${formatTime(a.created_at)}`,
+    success: () => uni.showToast({ title: '已复制', icon: 'none' }),
+  })
+}
 </script>
 
 <template>
-  <view class="page">
+  <view class="page" @touchstart="onTouchStart" @touchend="onTouchEnd">
     <!-- 顶部 -->
     <view class="header">
       <view class="header-row">
@@ -193,7 +247,7 @@ function tabTitle(t: TabKey): string {
         </view>
       </view>
       <view v-if="showServer" class="server-box">
-        <input v-model="serverUrl" class="server-input" placeholder="服务器地址，如 http://47.121.197.240:18080" />
+        <input v-model="serverUrl" class="server-input" placeholder="服务器地址，如 http://your-server:18080" />
         <view class="server-save" @tap="onSaveServer">保存</view>
       </view>
     </view>
@@ -256,11 +310,19 @@ function tabTitle(t: TabKey): string {
     <!-- 告警 -->
     <view v-else>
       <view v-if="alerts.length === 0" class="empty">暂无告警记录。</view>
-      <view v-for="a in filteredAlerts" :key="a.id" class="alert-card">
+      <view v-for="a in filteredAlerts" :key="a.id" class="alert-card" @tap="toggleAlert(a)">
         <view class="news-title">{{ a.message }}</view>
         <view class="news-meta">
           <text class="meta-text">{{ a.item_name }}</text>
           <text class="meta-text">{{ formatTime(a.created_at) }}</text>
+          <text class="alert-type">{{ alertTypeLabel(a.type) }}</text>
+        </view>
+        <view v-if="expandedAlert && expandedAlert.id === a.id" class="alert-detail">
+          <view class="alert-detail-row">类型: {{ alertTypeLabel(a.type) }}</view>
+          <view class="alert-detail-row">监控项: {{ a.item_name }}</view>
+          <view class="alert-detail-row">时间: {{ formatTime(a.created_at) }}</view>
+          <view class="alert-detail-row">内容: {{ a.message }}</view>
+          <view class="alert-copy" @tap.stop="onCopyAlertText(a)">复制告警</view>
         </view>
       </view>
     </view>
@@ -274,7 +336,7 @@ function tabTitle(t: TabKey): string {
   min-height: 100vh;
   background: #f5f6f8;
   padding: 0 16px;
-  padding-top: calc(var(--status-bar-height, 0px) + 12px);
+  padding-top: 12px;
 }
 .header {
   padding: 8px 0 12px;
@@ -477,6 +539,34 @@ function tabTitle(t: TabKey): string {
   background: #fdf3e3;
   padding: 1px 6px;
   border-radius: 8px;
+}
+.alert-type {
+  font-size: 11px;
+  color: #1a56db;
+  background: #e8f0fe;
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+.alert-detail {
+  margin-top: 10px;
+  background: #f8f9fb;
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.alert-detail-row {
+  font-size: 13px;
+  color: #444;
+  line-height: 1.7;
+  word-break: break-all;
+}
+.alert-copy {
+  margin-top: 8px;
+  text-align: center;
+  background: #17191c;
+  color: #fff;
+  padding: 7px;
+  border-radius: 8px;
+  font-size: 13px;
 }
 .empty {
   text-align: center;

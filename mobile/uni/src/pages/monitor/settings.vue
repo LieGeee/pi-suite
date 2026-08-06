@@ -1,14 +1,28 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { onShow } from '@dcloudio/uni-app'
-import { getSettings, saveSettings, type MonitorSettings } from '@/services/monitor'
+import {
+  clearAuth,
+  getSettings,
+  getUser,
+  isLoggedIn,
+  logout,
+  saveSettings,
+  type MonitorSettings,
+} from '@/services/monitor'
 
 const interval = ref('15')
 const webhookUrl = ref('')
 const serverchanKey = ref('')
 const notifyEnabled = ref(false)
+const aiFilterUrl = ref('')
+const aiFilterKey = ref('')
+const aiFilterModel = ref('')
+const aiFilterPrompt = ref('')
+const aiEnabled = ref(false)
 const loading = ref(false)
 const saving = ref(false)
+const userInfo = ref(getUser())
 
 onShow(load)
 
@@ -20,9 +34,33 @@ function load() {
       webhookUrl.value = s.webhook_url || ''
       serverchanKey.value = s.serverchan_key || ''
       notifyEnabled.value = !!s.notify_enabled
+      aiFilterUrl.value = s.ai_filter_url || ''
+      aiFilterKey.value = s.ai_filter_key || ''
+      aiFilterModel.value = s.ai_filter_model || ''
+      aiFilterPrompt.value = s.ai_filter_prompt || ''
+      aiEnabled.value = !!s.ai_filter_url && !!s.ai_filter_key
+      userInfo.value = getUser()
     })
     .catch((e) => uni.showToast({ title: (e as Error).message, icon: 'none' }))
     .finally(() => { loading.value = false })
+}
+
+function onToggleAI(event: Event) {
+  const v = Boolean((event as Event & { detail?: { value?: boolean } }).detail?.value)
+  aiEnabled.value = v
+}
+
+function onLogout() {
+  uni.showModal({
+    title: '退出登录',
+    content: '确定要退出当前账号吗？',
+    success: (r) => {
+      if (!r.confirm) return
+      logout().catch(() => {})
+      clearAuth()
+      uni.reLaunch({ url: '/pages/monitor/login' })
+    },
+  })
 }
 
 function onSave() {
@@ -37,6 +75,10 @@ function onSave() {
     webhook_url: webhookUrl.value.trim(),
     serverchan_key: serverchanKey.value.trim(),
     notify_enabled: notifyEnabled.value,
+    ai_filter_url: aiEnabled.value ? aiFilterUrl.value.trim() : '',
+    ai_filter_key: aiEnabled.value ? aiFilterKey.value.trim() : '',
+    ai_filter_model: aiFilterModel.value.trim() || 'deepseek-v4-flash',
+    ai_filter_prompt: aiFilterPrompt.value.trim(),
   })
     .then(() => uni.showToast({ title: '已保存', icon: 'success' }))
     .catch((e) => uni.showToast({ title: (e as Error).message, icon: 'none' }))
@@ -74,6 +116,42 @@ function onCopyServerChan() {
         <input v-model="interval" class="input" type="number" placeholder="15" />
       </view>
       <view class="hint">每间隔多少分钟抓取一次全部监控项，默认 15 分钟。</view>
+    </view>
+
+    <view class="card">
+      <view class="section-title">当前账号</view>
+      <view class="field">
+        <view class="label">用户名</view>
+        <view class="value">{{ userInfo?.username || '-' }}</view>
+      </view>
+      <view class="field">
+        <view class="label">昵称</view>
+        <view class="value">{{ userInfo?.nickname || '-' }}</view>
+      </view>
+      <view class="logout-btn" @tap="onLogout">退出登录</view>
+    </view>
+
+    <view class="card">
+      <view class="section-title">AI 新闻过滤</view>
+      <view class="field">
+        <view class="label">启用</view>
+        <switch :checked="aiEnabled" color="#17191c" @change="onToggleAI" />
+      </view>
+      <template v-if="aiEnabled">
+        <view class="field">
+          <view class="label">接口地址</view>
+          <input v-model="aiFilterUrl" class="input" placeholder="http://your-server:8888/v1/chat/completions" />
+        </view>
+        <view class="field">
+          <view class="label">API Key</view>
+          <input v-model="aiFilterKey" class="input" password placeholder="sk-..." />
+        </view>
+        <view class="field">
+          <view class="label">模型</view>
+          <input v-model="aiFilterModel" class="input" placeholder="deepseek-v4-flash" />
+        </view>
+        <view class="hint">启用后，推送前先由 AI 判断新闻是否有价值(默认只留技术相关)，避免无意义推送。</view>
+      </template>
     </view>
 
     <view class="card">
@@ -168,6 +246,21 @@ function onCopyServerChan() {
   border-radius: 8px;
 }
 .switch-field { justify-content: space-between; }
+.value {
+  flex: 1;
+  font-size: 14px;
+  color: #333;
+}
+.logout-btn {
+  margin-top: 10px;
+  text-align: center;
+  background: #fdecec;
+  color: #e5484d;
+  padding: 11px;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+}
 .hint {
   font-size: 12px;
   color: #8a9099;

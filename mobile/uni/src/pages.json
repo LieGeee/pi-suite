@@ -1,6 +1,13 @@
 {
   "pages": [
     {
+      "path": "pages/monitor/login",
+      "style": {
+        "navigationStyle": "custom",
+        "backgroundColor": "#f5f6f8"
+      }
+    },
+    {
       "path": "pages/tasks/index",
       "style": {
         "navigationStyle": "custom",

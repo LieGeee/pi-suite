@@ -30,12 +30,20 @@ pi-suite/
    ├─ client/                # Vite + React 移动 Web 客户端
    ├─ relay/                 # 桌面↔手机中继服务（WebSocket）
    └─ android/               # Capacitor Android 工程源码
+
+└─ server/                   # 云端后端服务
+   └─ pi-monitor/            # 7×24 监控服务（Go+gin+SQLite）
+
+└─ scripts/                  # 自动化脚本
+   ├─ deploy-monitor.sh      # 监控后端一条命令部署
+   └─ build-apk.sh           # 手机端 APK 一条命令构建+发布
 ```
 
 ## 架构
 
 ```text
 pi-gui desktop  <--WebSocket-->  pi-mobile-relay  <--WebSocket/HTTPS-->  mobile client (uni / React)
+pi-monitor (server)  <--REST+BearerToken-->  mobile uni 监控模块
 ```
 
 - **pi-gui desktop**：Electron 桌面客户端，管理 Pi 会话、技能、扩展、模型。

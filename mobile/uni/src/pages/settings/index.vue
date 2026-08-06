@@ -198,7 +198,7 @@ function onSimpleModeChange(event: Event) {
       <view class="header-row">
         <view>
           <text class="page-title">设置</text>
-          <text class="header-meta">移动同步 · v1.0.4</text>
+          <text class="header-meta">移动同步 · v1.0.5</text>
         </view>
       </view>
     </view>

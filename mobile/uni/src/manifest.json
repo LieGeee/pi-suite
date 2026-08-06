@@ -2,8 +2,8 @@
     "name" : "pi-gui Mobile",
     "appid" : "__UNI__0213B1B",
     "description" : "pi-gui mobile sync client",
-    "versionName" : "1.0.4",
-    "versionCode" : "104",
+    "versionName" : "1.0.5",
+    "versionCode" : "105",
     "transformPx" : false,
     "app-plus" : {
         "usingComponents" : true,

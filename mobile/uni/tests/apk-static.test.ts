@@ -11,20 +11,25 @@ function readText(relativePath: string): string {
   return readFileSync(join(inspectDir, relativePath), 'utf8')
 }
 
-test('current Android APK contains native barcode module and v1.0.3 app assets', () => {
+function readJson(relativePath: string): Record<string, unknown> {
+  return JSON.parse(readText(relativePath)) as Record<string, unknown>
+}
+
+test('current Android APK contains native barcode module and v1.0.5 app assets', () => {
   assert.equal(existsSync(apkPath), true, `${apkPath} does not exist`)
   rmSync(inspectDir, { recursive: true, force: true })
   mkdirSync(inspectDir, { recursive: true })
   execFileSync('unzip', ['-oq', apkPath, '-d', inspectDir])
 
   const dcloudProperties = readText('assets/data/dcloud_properties.xml')
-  const manifest = readText('assets/apps/__UNI__0213B1B/www/manifest.json')
-  const routes = readText('assets/apps/__UNI__0213B1B/www/app-config-service.js')
-  const appService = readText('assets/apps/__UNI__0213B1B/www/app-service.js')
+  const manifest = readJson('assets/apps/HBuilder/www/manifest.json')
+  const routes = readText('assets/apps/HBuilder/www/app-config-service.js')
+  const appService = readText('assets/apps/HBuilder/www/app-service.js')
 
   assert.match(dcloudProperties, /feature name="Barcode"/)
-  assert.match(manifest, /"code":"103"/)
-  assert.match(manifest, /"name":"1\.0\.3"/)
+  const version = manifest.version as { name?: string; code?: string }
+  assert.equal(version.code, '105')
+  assert.equal(version.name, '1.0.5')
   assert.match(routes, /pages\/notifications\/index/)
   assert.match(appService, /手机生成 Token/)
   assert.match(appService, /扫码失败/)

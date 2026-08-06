@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pi-monitor 监控</title>
+<style>
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f5f6f8;color:#17191c}
+header{background:#17191c;color:#fff;padding:16px 24px;display:flex;justify-content:space-between;align-items:center}
+header h1{margin:0;font-size:18px}
+main{padding:20px 24px;max-width:1000px;margin:0 auto}
+.card{background:#fff;border-radius:10px;padding:18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card h2{margin:0 0 12px;font-size:15px;color:#333}
+.item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #f0f0f0}
+.item:last-child{border-bottom:none}
+.item .name{font-weight:600}
+.item .status{font-size:12px;padding:2px 8px;border-radius:10px}
+.ok{background:#e6f7ec;color:#0a7a3a}
+.fail{background:#fdecea;color:#c0392b}
+.pending{background:#f0f0f0;color:#666}
+.item .detail{font-size:13px;color:#666;margin-top:3px}
+.badge{background:#eee;border-radius:10px;padding:2px 8px;font-size:12px;color:#555}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#999}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.stat{background:#fff;border-radius:10px;padding:14px;text-align:center}
+.stat b{display:block;font-size:26px}
+.stat span{font-size:12px;color:#888}
+.nav{display:flex;gap:12px;margin:16px 0;flex-wrap:wrap}
+.nav a{background:#17191c;color:#fff;text-decoration:none;padding:8px 14px;border-radius:8px;font-size:14px}
+.nav a.ghost{background:#fff;color:#17191c;border:1px solid #ddd}
+.news-item{padding:10px 0;border-bottom:1px solid #f0f0f0}
+.news-item a{color:#17191c;text-decoration:none;font-weight:500}
+.news-item a:hover{text-decoration:underline}
+.news-item .meta{font-size:12px;color:#888;margin-top:4px}
+.alert-item{padding:10px 0;border-bottom:1px solid #f0f0f0;font-size:14px}
+.alert-item .time{font-size:12px;color:#888;margin-left:8px}
+@media(max-width:600px){main{padding:12px}header{padding:12px 16px}}
+</style>
+</head>
+<body>
+<header><h1>pi-monitor 7x24 监控</h1><span class="mono" id="now"></span></header>
+<main>
+  <div class="nav">
+    <a href="/">总览</a>
+    <a href="/#news">新闻</a>
+    <a href="/#alerts">告警</a>
+    <a href="/api/v1/items" class="ghost">API JSON</a>
+  </div>
+  <div class="grid" id="stats"></div>
+  <div class="card">
+    <h2>监控项</h2>
+    <div id="items"></div>
+  </div>
+  <div class="card" id="news">
+    <h2>最新新闻</h2>
+    <div id="newsList"></div>
+  </div>
+  <div class="card" id="alerts">
+    <h2>最近告警</h2>
+    <div id="alertsList"></div>
+  </div>
+</main>
+<script>
+async function api(p){const r=await fetch(p);if(!r.ok)throw new Error(r.status);return r.json()}
+function esc(s){const d=document.createElement('div');d.textContent=(s==null?'':s);return d.innerHTML}
+async function load(){
+  var its=(await api('/api/v1/items')).items||[];
+  var als=(await api('/api/v1/alerts?limit=8')).alerts||[];
+  var ns=(await api('/api/v1/news?limit=8')).news||[];
+  document.getElementById('stats').innerHTML=
+    '<div class="stat"><b>'+its.length+'</b><span>监控项</span></div>'+
+    '<div class="stat"><b>'+its.filter(function(x){return x.enabled}).length+'</b><span>启用中</span></div>'+
+    '<div class="stat"><b>'+its.filter(function(x){return x.last_status==="ok"}).length+'</b><span>正常</span></div>'+
+    '<div class="stat"><b>'+als.length+'</b><span>最近告警</span></div>';
+  document.getElementById('items').innerHTML=its.map(function(x){
+    var stc=x.last_status==="ok"?"ok":(x.last_status==="fail"?"fail":"pending");
+    return '<div class="item"><div><span class="name">'+esc(x.name)+'</span> <span class="badge">'+x.type+'</span> <span class="badge">'+(x.enabled?"启用":"停用")+'</span>'+
+      '<div class="detail">'+esc(x.last_detail||"尚未抓取")+'</div>'+
+      '<div class="mono">目标: '+esc(x.target)+' | 最近: '+esc((x.last_checked||"").replace("T"," "))+'</div></div>'+
+      '<span class="status '+stc+'">'+x.last_status+'</span></div>';
+  }).join("")||'<div class="detail">暂无监控项</div>';
+  document.getElementById('newsList').innerHTML=ns.map(function(n){
+    return '<div class="news-item"><a href="'+esc(n.url)+'" target="_blank">'+esc(n.title)+'</a>'+
+      '<div class="meta">'+esc(n.source)+' | 命中: '+esc(n.matched)+'</div></div>';
+  }).join("")||'<div class="detail">暂无新闻</div>';
+  document.getElementById('alertsList').innerHTML=als.map(function(a){
+    return '<div class="alert-item">'+esc(a.message)+'<span class="time">'+esc((a.created_at||"").replace("T"," "))+'</span></div>';
+  }).join("")||'<div class="detail">暂无告警</div>';
+  document.getElementById('now').textContent=new Date().toLocaleString("zh-CN");
+}
+load();setInterval(load,30000);
+</script>
+</body>
+</html>

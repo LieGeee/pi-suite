@@ -1,0 +1,12 @@
+# 运行时数据
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 构建产物
+bin/
+pi-monitor
+pi-monitor-linux
+pi-monitor-win.exe
+*.log

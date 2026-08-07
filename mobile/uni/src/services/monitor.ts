@@ -125,9 +125,8 @@ export interface AlertItem {
 // ---- 本地配置存储 ----
 
 export function defaultBaseUrl(): string {
-  // 构建时注入: vite 通过 import.meta.env.VITE_MONITOR_BASE 覆盖
-  const fromEnv = (import.meta as any).env?.VITE_MONITOR_BASE
-  return fromEnv || 'http://127.0.0.1:18080'
+  // 构建时注入: vite define 替换 __VITE_MONITOR_BASE__ (由 VITE_MONITOR_BASE 环境变量设置)
+  return (typeof __VITE_MONITOR_BASE__ !== 'undefined' ? __VITE_MONITOR_BASE__ : '') || 'http://127.0.0.1:18080'
 }
 
 export function getBaseUrl(): string {

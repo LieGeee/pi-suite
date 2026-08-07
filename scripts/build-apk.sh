@@ -52,7 +52,15 @@ print(f'manifest -> v{name} ({code})')
 EOF
 
 echo "=== [1/4] uni-app 构建 app-android 资源 ==="
-pnpm run build:app-android
+# 注入服务器地址(脱敏后源码不含真实 IP, 构建时用 VITE_MONITOR_BASE 注入)
+if [ -n "${VITE_MONITOR_BASE:-}" ]; then
+    echo "📡 注入服务器地址: $VITE_MONITOR_BASE"
+    VITE_MONITOR_BASE="$VITE_MONITOR_BASE" pnpm run build:app-android
+else
+    echo "⚠️  未设置 VITE_MONITOR_BASE, APK 默认地址为 127.0.0.1(仅本机调试用)"
+    echo "   部署用: VITE_MONITOR_BASE=http://你的服务器:18080 bash scripts/build-apk.sh"
+    pnpm run build:app-android
+fi
 echo "✅ 构建完成"
 
 echo "=== [2/4] 同步 www 到原生 WebView 壳 ==="

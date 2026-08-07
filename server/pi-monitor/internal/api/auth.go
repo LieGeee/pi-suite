@@ -1,7 +1,6 @@
 package api
 
 import (
-	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -11,10 +10,9 @@ import (
 // authMiddleware 校验 Bearer Token, 通过后把 user 放入 context
 func authMiddleware(st *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 放行登录/注册/健康检查
+		// 放行登录/注册
 		if c.Request.URL.Path == "/api/v1/auth/register" ||
-			c.Request.URL.Path == "/api/v1/auth/login" ||
-			c.Request.URL.Path == "/api/v1/auth/me" && c.Request.Method == http.MethodGet {
+			c.Request.URL.Path == "/api/v1/auth/login" {
 			c.Next()
 			return
 		}

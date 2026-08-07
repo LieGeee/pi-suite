@@ -39,8 +39,8 @@ func NewRouter(st *store.Store, wk *worker.Worker, sc *scraper.Client) *gin.Engi
 	api := r.Group("/api/v1")
 	api.Use(authMiddleware(st))
 	{
-		r.GET("/api/v1/auth/me", auth.Me)
-		r.POST("/api/v1/auth/logout", auth.Logout)
+		api.GET("/auth/me", auth.Me)
+		api.POST("/auth/logout", auth.Logout)
 
 		// 监控项 CRUD
 		api.GET("/items", s.listItems)
